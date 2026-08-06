@@ -110,6 +110,11 @@ func (d *tuiDiagnostics) Writer() io.Writer {
 // StartWatchdog arms a 1s heartbeat. If the TUI event loop makes no progress for
 // 10s, it dumps all goroutines, syncs the log, and kills the Bubble Tea program
 // so the terminal is restored instead of remaining frozen (#7435).
+//
+// Liveness is judged from markProgress, which chatTUI.Update refreshes on every
+// message. Idle keepalive is the chatTUI's own watchdogPing (a 1s self-tick), so
+// a healthy idle TUI keeps the timestamp fresh and only a genuinely wedged event
+// loop — one that stops draining messages — trips the stall.
 func (d *tuiDiagnostics) StartWatchdog(p *tea.Program) {
 	if d == nil || p == nil {
 		return

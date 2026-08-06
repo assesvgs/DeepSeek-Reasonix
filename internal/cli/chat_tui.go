@@ -475,6 +475,13 @@ func shutdownNow() tea.Msg { return tuiShutdownMsg{} }
 // Ns" counter in the status line.
 type elapsedTickMsg struct{}
 
+// watchdogPingMsg is a once-a-second self-ping that keeps the event loop
+// waking while the TUI is idle. The stall watchdog judges liveness from
+// markProgress, which runs on every Update; without a periodic message the
+// loop blocks in select during idleness and the watchdog misreads a healthy
+// idle TUI as a frozen one and kills it after tuiWatchdogStall (#7663).
+type watchdogPingMsg struct{}
+
 // balanceMsg carries the result of an async wallet-balance fetch; text is the
 // formatted readout ("" when none/failed).
 type balanceMsg struct{ text string }
@@ -866,6 +873,7 @@ func (m chatTUI) Init() tea.Cmd {
 		fetchBalance(m.ctrl),
 		m.runStatusline(), // nil (no-op) unless a custom status line is configured
 		m.refreshGitStatus(),
+		watchdogPing(),
 	)
 }
 
@@ -1975,6 +1983,11 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tickSubagentProgress()
 			cmds = append(cmds, elapsedTick())
 		}
+
+	case watchdogPingMsg:
+		// Re-arm unconditionally: the ping exists to wake the event loop while
+		// idle so the stall watchdog sees liveness (see watchdogPingMsg).
+		cmds = append(cmds, watchdogPing())
 
 	case spinner.TickMsg:
 		if m.state == tuiRunning {
@@ -4539,6 +4552,13 @@ func waitForAgentEvent(ch chan event.Event) tea.Cmd {
 
 func elapsedTick() tea.Cmd {
 	return tea.Tick(time.Second, func(_ time.Time) tea.Msg { return elapsedTickMsg{} })
+}
+
+// watchdogPing arms the next idle keepalive ping. It is unconditional (unlike
+// elapsedTick, which only re-arms while a turn runs) so the event loop always
+// wakes at least once a second — see watchdogPingMsg.
+func watchdogPing() tea.Cmd {
+	return tea.Tick(time.Second, func(_ time.Time) tea.Msg { return watchdogPingMsg{} })
 }
 
 // runSlashCommand handles "/<cmd> <args>" input. Local commands queue their

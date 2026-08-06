@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"reasonix/internal/control"
 	"reasonix/internal/event"
@@ -164,6 +165,33 @@ func TestTUIDiagnosticsMilestoneFlushesNonEmptyLog(t *testing.T) {
 	for _, want := range []string{"diagnostics_started", "config_load_begin", "controller_build_done"} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("log missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestWatchdogPingKeepsIdleTUIAlive is the regression test for the watchdog
+// killing a healthy idle TUI: the stall watchdog judges liveness from
+// lastProgress, which only markProgress refreshes, and markProgress only runs
+// inside Update. While idle the bubbletea loop receives no messages at all, so
+// before watchdogPing existed an untouched TUI went silent and was killed after
+// tuiWatchdogStall. Each ping must refresh lastProgress and re-arm the next one.
+func TestWatchdogPingKeepsIdleTUIAlive(t *testing.T) {
+	d := startTUIDiagnostics(t.TempDir())
+	t.Cleanup(d.Close)
+
+	m := newChatTUI(control.New(control.Options{}), "", make(chan event.Event, 1), 80)
+	m.diagnostics = d
+
+	// Simulate idling longer than the stall threshold with the keepalive ping
+	// as the only traffic, exactly what an untouched terminal produces.
+	for i := 0; i < int(tuiWatchdogStall.Seconds())+3; i++ {
+		next, cmd := m.Update(watchdogPingMsg{})
+		m = next.(chatTUI)
+		if cmd == nil {
+			t.Fatalf("ping %d: keepalive was not re-armed; idle loop would go silent", i)
+		}
+		if age := time.Since(time.Unix(0, d.lastProgress.Load())); age >= tuiWatchdogStall {
+			t.Fatalf("ping %d: lastProgress age %s >= stall %s; watchdog would kill the idle TUI", i, age, tuiWatchdogStall)
 		}
 	}
 }
