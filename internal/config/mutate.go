@@ -288,15 +288,18 @@ func configEditLockRegistryDir() (string, error) {
 		return "", fmt.Errorf("lock config edits: OS user identity unavailable")
 	}
 	digest := sha256.Sum256([]byte(identity))
-	if runtime.GOOS != "windows" {
-		// The OS-wide temporary root is invariant across process-specific TMPDIR
-		// overrides. The per-user directory is verified and forced to mode 0700
-		// before the advisory lock file is opened.
-		return filepath.Join(string(filepath.Separator), "tmp", fmt.Sprintf("reasonix-config-locks-%x", digest[:8])), nil
-	}
 	home := strings.TrimSpace(current.HomeDir)
 	if home == "" {
 		return "", fmt.Errorf("lock config edits: OS user home unavailable")
+	}
+	if runtime.GOOS != "windows" {
+		// Keep the lock registry inside the user's own state root rather than
+		// the OS-wide /tmp: on Android/Termux the shared /tmp is owned by
+		// another user and not writable, and a fixed home-relative path keeps
+		// the registry invariant across process-specific TMPDIR overrides.
+		// The per-user directory is verified and forced to mode 0700 before
+		// the advisory lock file is opened.
+		return filepath.Join(filepath.Clean(home), ".reasonix", "tmp", fmt.Sprintf("reasonix-config-locks-%x", digest[:8])), nil
 	}
 	return filepath.Join(filepath.Clean(home), ".reasonix", "locks", fmt.Sprintf("config-edits-%x", digest[:8])), nil
 }
