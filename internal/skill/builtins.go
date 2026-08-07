@@ -299,7 +299,7 @@ func builtinSkills() []Skill {
 		},
 		{
 			Name:         "explore",
-			Description:  "Explore the codebase in an isolated subagent — wide-net read-only investigation that returns one distilled answer. Best for: 'find all places that...', 'how does X work across the project', 'survey the code for Y'.",
+			Description:  "在隔离子代理中做一次大范围只读代码库调查，返回一份提炼后的结论。适用于：'找出所有使用 X 的地方'、'Y 在项目中如何工作'、'调研代码 Z'。",
 			Body:         builtinExploreBody,
 			Scope:        ScopeBuiltin,
 			Path:         "(builtin)",
@@ -310,7 +310,7 @@ func builtinSkills() []Skill {
 		},
 		{
 			Name:           "research",
-			Description:    "Research a question by combining web_fetch + code reading in an isolated subagent. Best for: 'is X supported by lib Y', 'what's the canonical way to do Z', 'compare our impl against the spec'.",
+			Description:    "在隔离子代理中结合 web_fetch 与代码阅读研究一个问题。适用于：'lib Y 是否支持 X'、'做 Z 的规范做法是什么'、'将我们的实现与规范对比'。",
 			Body:           builtinResearchBody,
 			Scope:          ScopeBuiltin,
 			Path:           "(builtin)",
@@ -332,7 +332,7 @@ func builtinSkills() []Skill {
 		},
 		{
 			Name:         "review",
-			Description:  "Review the pending changes (current branch diff by default) in an isolated subagent — flags correctness, security, missing tests, hidden behavior changes; reports a verdict + per-issue file:line. Read-only.",
+			Description:  "在隔离子代理中审查待提交改动（默认当前分支 diff）——标记正确性、安全、缺失测试、隐藏行为变化；给出结论与每个问题的 file:line。只读。",
 			Body:         builtinReviewBody,
 			Scope:        ScopeBuiltin,
 			Path:         "(builtin)",
@@ -344,7 +344,7 @@ func builtinSkills() []Skill {
 		},
 		{
 			Name:         "security-review",
-			Description:  "Security-focused review of the current branch diff in an isolated subagent — flags injection/authz/secrets/deserialization/path-traversal/crypto issues, severity-tagged. Read-only.",
+			Description:  "在隔离子代理中做安全重点审查（当前分支 diff）——标记注入/鉴权/密钥/反序列化/路径穿越/加密问题，按严重程度分级。只读。",
 			Body:         builtinSecurityReviewBody,
 			Scope:        ScopeBuiltin,
 			Path:         "(builtin)",

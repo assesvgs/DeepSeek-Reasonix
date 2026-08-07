@@ -406,16 +406,16 @@ func BuiltinSubagentTools(store *Store, runner SubagentRunner, profileResolver .
 		toolName, skillName, description, taskDesc string
 	}{
 		{"explore", "explore",
-			"Run a focused read-only codebase investigation in an isolated subagent. Use for broad survey questions across many files — 'find all places that X', 'how does Y work across the project', 'audit Z'. Returns one distilled answer with file:line citations. Its reads + reasoning never enter your context, unlike chained read_file.",
+			"在隔离子代理中做一次聚焦的只读代码库调查。用于跨多文件的宽泛调研——'找出所有使用 X 的地方'、'Y 在项目中如何工作'、'审计 Z'。返回一份带 file:line 引用的提炼结论。与链式 read_file 不同，其阅读与推理不会进入你的上下文。",
 			"Concrete investigation question. The subagent has none of your context — write a self-contained prompt naming the symbol / pattern / behavior to survey."},
 		{"research", "research",
-			"Combine web_fetch + code reading in an isolated subagent. Use when the answer needs both an external reference and local verification — 'is X supported by lib Y', 'compare our impl against the spec'. Returns one synthesis citing code (file:line) and web (URL).",
+			"在隔离子代理中结合 web_fetch 与代码阅读。用于答案既需要外部资料又需要本地验证时——'lib Y 是否支持 X'、'将我们的实现与规范对比'。返回一份同时引用代码（file:line）与网页（URL）的综合结论。",
 			"Concrete research question. The subagent has none of your context — name the external thing to look up and the local code to compare against."},
 		{"review", "review",
-			"Review the pending changes (current branch diff) in an isolated subagent — flags correctness / security / missing-tests / hidden behavior per file:line. Read-only; you decide what to act on. Use before suggesting a PR-shaped change or after finishing a multi-step edit.",
+			"在隔离子代理中审查待提交改动（当前分支 diff）——按 file:line 标记正确性/安全/缺失测试/隐藏行为。只读；由你决定如何处理。适合在提出 PR 形改动前或完成多步编辑后使用。",
 			"What to focus the review on (e.g. 'focus on the auth changes' or 'general'). The subagent reads the diff itself."},
 		{"security_review", "security-review",
-			"Security-focused review of the current branch diff in an isolated subagent — injection / authz / secrets / deserialization / path-traversal / crypto, severity-tagged. Read-only. Use when shipping changes that touch auth, input parsing, file IO, or external requests.",
+			"在隔离子代理中做安全重点审查（当前分支 diff）——注入/鉴权/密钥/反序列化/路径穿越/加密，按严重程度分级。只读。适用于涉及认证、输入解析、文件 IO 或外部请求的改动上线前。",
 			"Optional scope hint (e.g. 'focus on token handling in internal/auth/') or 'full' for everything in the diff."},
 	}
 	var out []tool.Tool
