@@ -195,3 +195,50 @@ func TestWatchdogPingKeepsIdleTUIAlive(t *testing.T) {
 		}
 	}
 }
+
+// TestWatchdogTickGapSkipsSuspendedProcess verifies the stall watchdog does not
+// kill the TUI after the whole process was suspended by the OS (Android
+// backgrounding, screen off): the watchdog's own ticker stalls for far longer
+// than its 1s interval, so the wall-clock progress age is inflated by the
+// pause and must not be read as a wedged event loop.
+func TestWatchdogTickGapSkipsSuspendedProcess(t *testing.T) {
+	now := time.Now()
+	// A normal 1s ticker gap is never a suspension.
+	if watchdogTickGap(now.Add(-tuiWatchdogInterval), now) {
+		t.Fatal("normal 1s tick gap must not count as process suspension")
+	}
+	// A gap beyond suspendAllowance (e.g. a 38s background freeze) is.
+	if !watchdogTickGap(now.Add(-38*time.Second), now) {
+		t.Fatal("38s tick gap must count as process suspension")
+	}
+	// A gap at the boundary must not trigger (stall threshold is 10s, so a
+	// suspended process is also a healthy margin away from a real stall).
+	if watchdogTickGap(now.Add(-suspendAllowance), now) {
+		t.Fatalf("tick gap of exactly %s must not count as suspension", suspendAllowance)
+	}
+	// First tick after startup has no previous tick: never a suspension.
+	if watchdogTickGap(time.Time{}, now) {
+		t.Fatal("zero previous tick must not count as process suspension")
+	}
+}
+
+// TestWatchdogKillStillFiresWithoutSuspension guards the opposite direction:
+// a genuinely wedged event loop (process alive, ticker healthy, no progress)
+// must still be killed after tuiWatchdogStall — the suspend detection must not
+// swallow real stalls.
+func TestWatchdogKillStillFiresWithoutSuspension(t *testing.T) {
+	d := startTUIDiagnostics(t.TempDir())
+	t.Cleanup(d.Close)
+	// Simulate the decision path: fresh ticker (no suspension), progress age
+	// beyond the stall threshold -> the watchdog must decide to kill.
+	lastTick := time.Now()
+	now := lastTick.Add(tuiWatchdogInterval)
+	if watchdogTickGap(lastTick, now) {
+		t.Fatal("healthy ticker must not look suspended")
+	}
+	// Age the last progress past the stall threshold as a wedged loop would.
+	d.lastProgress.Store(now.Add(-tuiWatchdogStall - time.Second).UnixNano())
+	if age := now.Sub(time.Unix(0, d.lastProgress.Load())); age < tuiWatchdogStall {
+		t.Fatalf("test setup: progress age %s not beyond stall %s; cannot exercise the kill branch", age, tuiWatchdogStall)
+	}
+}

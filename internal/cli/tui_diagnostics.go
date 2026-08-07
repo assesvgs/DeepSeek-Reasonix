@@ -20,6 +20,12 @@ const (
 	tuiDiagnosticLogRetention = 7 * 24 * time.Hour
 	tuiWatchdogInterval       = time.Second
 	tuiWatchdogStall          = 10 * time.Second
+	// suspendAllowance is the maximum expected gap between watchdog ticks
+	// (ticker fires every tuiWatchdogInterval). A larger gap means the whole
+	// process was suspended by the OS (Android backgrounding, screen off),
+	// so the wall-clock stall age is inflated by the pause and must not be
+	// trusted to kill the TUI — see watchdogTickGap.
+	suspendAllowance = 5 * time.Second
 )
 
 // tuiDiagnostics owns process-level diagnostics while an interactive terminal
@@ -132,11 +138,23 @@ func (d *tuiDiagnostics) StartWatchdog(p *tea.Program) {
 func (d *tuiDiagnostics) watch(p *tea.Program) {
 	ticker := time.NewTicker(tuiWatchdogInterval)
 	defer ticker.Stop()
+	var lastTick time.Time
 	for {
 		select {
 		case <-d.stopWatch:
 			return
 		case now := <-ticker.C:
+			if watchdogTickGap(lastTick, now) {
+				// The whole process was suspended (Android backgrounding,
+				// screen off, Doze): this ticker gap dwarfs the 1s interval,
+				// so lastProgress's wall-clock age is inflated by the pause,
+				// not by a wedged event loop. Refresh liveness and keep
+				// watching instead of killing a healthy-but-asleep TUI.
+				lastTick = now
+				d.markProgress()
+				continue
+			}
+			lastTick = now
 			last := time.Unix(0, d.lastProgress.Load())
 			age := now.Sub(last)
 			_, _ = fmt.Fprintf(d.Writer(), "heartbeat t=%s last_progress_age=%s\n",
@@ -153,6 +171,17 @@ func (d *tuiDiagnostics) watch(p *tea.Program) {
 			return
 		}
 	}
+}
+
+// watchdogTickGap reports whether the gap since the previous watchdog tick is
+// too large to be explained by the 1s ticker. A big gap means the OS suspended
+// the whole process (Termux backgrounding on Android), during which no
+// goroutine — the watchdog included — could run. The stall watchdog must then
+// not trust the wall-clock progress age, because the pause inflated it while
+// the event loop was simply asleep, not wedged. A zero previous tick (process
+// just started) is never treated as a suspension.
+func watchdogTickGap(prevTick, now time.Time) bool {
+	return !prevTick.IsZero() && now.Sub(prevTick) > suspendAllowance
 }
 
 func (d *tuiDiagnostics) dumpGoroutines(reason string) {
