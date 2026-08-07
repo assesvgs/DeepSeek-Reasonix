@@ -28,6 +28,13 @@ const (
 	suspendAllowance = 5 * time.Second
 )
 
+// monoAnchor is a fixed monotonic reference point for lastProgress. time.Since
+// uses the monotonic clock when both times carry it, so durations since this
+// anchor are immune to wall-clock jumps and to system suspend — during which
+// CLOCK_MONOTONIC pauses while CLOCK_REALTIME keeps running (see the
+// watchdog's lastProgress comment).
+var monoAnchor = time.Now()
+
 // tuiDiagnostics owns process-level diagnostics while an interactive terminal
 // UI is alive. Bubble Tea owns the terminal screen, so background logs and
 // plugin stderr must go to a private file instead of bypassing its renderer.
@@ -44,7 +51,14 @@ type tuiDiagnostics struct {
 	path     string
 	close    sync.Once
 
-	lastProgress atomic.Int64 // unix nano of last Update/View progress
+	// lastProgress stores elapsed monotonic time since monoAnchor (see below)
+	// at the last Update/View progress. Comparing two monotonic readings —
+	// instead of wall clock — keeps the stall age honest across system
+	// suspend: on Android lock/screen-off, CLOCK_MONOTONIC pauses while
+	// CLOCK_REALTIME keeps running, so a wall-clock age would read as a
+	// wedged event loop and the TUI would be killed after waking from a
+	// healthy sleep.
+	lastProgress atomic.Int64 // elapsed monotonic ns of last Update/View progress
 	stopWatch    chan struct{}
 	watchOnce    sync.Once
 	watchWG      sync.WaitGroup
@@ -90,12 +104,14 @@ func (d *tuiDiagnostics) Sync() {
 	_ = d.file.Sync()
 }
 
-// markProgress records that the TUI event loop is alive.
+// markProgress records that the TUI event loop is alive. The value is a
+// monotonic-clock reading (see lastProgress): wall-clock ages are inflated
+// by system suspend, which would trip the stall watchdog on resume.
 func (d *tuiDiagnostics) markProgress() {
 	if d == nil {
 		return
 	}
-	d.lastProgress.Store(time.Now().UnixNano())
+	d.lastProgress.Store(time.Since(monoAnchor).Nanoseconds())
 }
 
 // Path returns the diagnostic log path (empty when falling back to Discard).
@@ -147,16 +163,24 @@ func (d *tuiDiagnostics) watch(p *tea.Program) {
 			if watchdogTickGap(lastTick, now) {
 				// The whole process was suspended (Android backgrounding,
 				// screen off, Doze): this ticker gap dwarfs the 1s interval,
-				// so lastProgress's wall-clock age is inflated by the pause,
-				// not by a wedged event loop. Refresh liveness and keep
-				// watching instead of killing a healthy-but-asleep TUI.
+				// so the progress age is inflated by the pause, not by a
+				// wedged event loop. Refresh liveness and keep watching
+				// instead of killing a healthy-but-asleep TUI. Log the skip
+				// so suspensions are observable in the diagnostic file.
+				gap := now.Sub(lastTick).Round(time.Millisecond)
 				lastTick = now
 				d.markProgress()
+				_, _ = fmt.Fprintf(d.Writer(), "heartbeat t=%s SUSPENDED tick_gap=%s; liveness refreshed\n",
+					now.UTC().Format(time.RFC3339Nano), gap)
+				d.Sync()
 				continue
 			}
 			lastTick = now
-			last := time.Unix(0, d.lastProgress.Load())
-			age := now.Sub(last)
+			// Monotonic age: immune to wall-clock jumps and system suspend,
+			// which pauses CLOCK_MONOTONIC (see lastProgress). A genuinely
+			// wedged event loop keeps the monotonic clock advancing, so the
+			// stall still trips there as intended.
+			age := time.Duration(time.Since(monoAnchor).Nanoseconds() - d.lastProgress.Load())
 			_, _ = fmt.Fprintf(d.Writer(), "heartbeat t=%s last_progress_age=%s\n",
 				now.UTC().Format(time.RFC3339Nano), age.Round(time.Millisecond))
 			d.Sync()

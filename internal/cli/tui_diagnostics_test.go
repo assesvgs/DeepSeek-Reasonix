@@ -190,7 +190,7 @@ func TestWatchdogPingKeepsIdleTUIAlive(t *testing.T) {
 		if cmd == nil {
 			t.Fatalf("ping %d: keepalive was not re-armed; idle loop would go silent", i)
 		}
-		if age := time.Since(time.Unix(0, d.lastProgress.Load())); age >= tuiWatchdogStall {
+		if age := time.Duration(time.Since(monoAnchor).Nanoseconds() - d.lastProgress.Load()); age >= tuiWatchdogStall {
 			t.Fatalf("ping %d: lastProgress age %s >= stall %s; watchdog would kill the idle TUI", i, age, tuiWatchdogStall)
 		}
 	}
@@ -237,8 +237,37 @@ func TestWatchdogKillStillFiresWithoutSuspension(t *testing.T) {
 		t.Fatal("healthy ticker must not look suspended")
 	}
 	// Age the last progress past the stall threshold as a wedged loop would.
-	d.lastProgress.Store(now.Add(-tuiWatchdogStall - time.Second).UnixNano())
-	if age := now.Sub(time.Unix(0, d.lastProgress.Load())); age < tuiWatchdogStall {
+	d.lastProgress.Store(time.Since(monoAnchor).Nanoseconds() - (tuiWatchdogStall + time.Second).Nanoseconds())
+	if age := time.Duration(time.Since(monoAnchor).Nanoseconds() - d.lastProgress.Load()); age < tuiWatchdogStall {
 		t.Fatalf("test setup: progress age %s not beyond stall %s; cannot exercise the kill branch", age, tuiWatchdogStall)
+	}
+}
+
+// TestWatchdogSuspendDoesNotKill is the regression test for the stall watchdog
+// killing a healthy TUI after Android system suspend (lock/screen-off): while
+// the device sleeps, CLOCK_MONOTONIC pauses and CLOCK_REALTIME keeps running,
+// so a wall-clock progress age is inflated by the whole sleep and reads as a
+// wedged event loop. The age must be measured on the monotonic clock — a big
+// wall gap with a small monotonic gap (suspend resumed) must stay far below
+// the stall threshold.
+func TestWatchdogSuspendDoesNotKill(t *testing.T) {
+	d := startTUIDiagnostics(t.TempDir())
+	t.Cleanup(d.Close)
+
+	// A 5-minute wall gap (the suspend) that the monotonic clock did not
+	// count, plus a small monotonic age since the last progress.
+	wallElapsed := 5 * time.Minute
+	monoAge := 2 * time.Second
+	d.lastProgress.Store(time.Since(monoAnchor).Nanoseconds() - monoAge.Nanoseconds())
+
+	if wallAge := time.Since(time.Now().Add(-wallElapsed)); wallAge < tuiWatchdogStall {
+		t.Fatalf("test setup: wall age %s not beyond stall %s; cannot contrast the two clocks", wallAge, tuiWatchdogStall)
+	}
+	age := time.Duration(time.Since(monoAnchor).Nanoseconds() - d.lastProgress.Load())
+	if age >= tuiWatchdogStall {
+		t.Fatalf("monotonic age %s >= stall %s; suspend would be misread as a wedged event loop and the TUI killed", age, tuiWatchdogStall)
+	}
+	if age > monoAge+time.Second {
+		t.Fatalf("monotonic age %s unexpectedly larger than the seeded age %s", age, monoAge)
 	}
 }
