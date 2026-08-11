@@ -32,7 +32,7 @@ const (
 	ErrInternal       = -32603
 )
 
-// --- initialize ---
+// initialize
 
 // InitializeParams is the client's handshake. The agent records the client's
 // capabilities — fs read/write proxying and host terminals are used when
@@ -90,6 +90,8 @@ type AgentCapabilities struct {
 // ACP v1 reserves agentCapabilities._meta for vendor capability discovery.
 type ReasonixExtensionCapabilities struct {
 	SessionSteer *SessionSteerCapability `json:"sessionSteer,omitempty"`
+	// SessionInbox advertises the durable session-level instruction queue.
+	SessionInbox *SessionInboxCapability `json:"sessionInbox,omitempty"`
 	// SessionReloadExtensions advertises the vendor runtime-reload method.
 	SessionReloadExtensions *SessionReloadExtensionsCapability `json:"sessionReloadExtensions,omitempty"`
 	// ExtensionSurface advertises structured extension-UI surface support:
@@ -100,6 +102,12 @@ type ReasonixExtensionCapabilities struct {
 // SessionSteerCapability identifies the vendor-namespaced steering method.
 type SessionSteerCapability struct {
 	Method string `json:"method"`
+}
+
+// SessionInboxCapability advertises durable inbox methods (schemaVersion 1).
+type SessionInboxCapability struct {
+	SchemaVersion int               `json:"schemaVersion"`
+	Methods       map[string]string `json:"methods"`
 }
 
 // SessionReloadExtensionsCapability identifies the vendor-namespaced runtime
@@ -118,7 +126,7 @@ const (
 )
 
 // ExtensionSurfaceCapability advertises that a participant renders structured
-// extension-UI surfaces (Extension Protocol v1) natively.
+// extension-UI surfaces (Extension Protocol v2) natively.
 type ExtensionSurfaceCapability struct {
 	Supported     bool `json:"supported"`
 	SchemaVersion int  `json:"schemaVersion"`
@@ -168,7 +176,7 @@ type AuthenticateParams struct {
 // AuthenticateResult is the empty authentication ack.
 type AuthenticateResult struct{}
 
-// --- session/new ---
+// session/new
 
 // SessionNewParams opens a session rooted at cwd, optionally with MCP servers
 // the agent should connect for the session's lifetime.
@@ -259,7 +267,7 @@ type SessionNewResult struct {
 	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 }
 
-// --- session modes ---
+// session modes
 
 // SessionMode is one operating mode the client can switch the session into.
 type SessionMode struct {
@@ -297,7 +305,7 @@ type SessionModelState struct {
 	CurrentModelID  string      `json:"currentModelId"`
 }
 
-// --- session/load ---
+// session/load
 
 // SessionLoadParams resumes a session saved under sessionId (the id a prior
 // session/new returned), optionally re-rooting it at cwd with fresh MCP servers.
@@ -317,7 +325,7 @@ type SessionLoadResult struct {
 	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 }
 
-// --- session/resume ---
+// session/resume
 
 // SessionResumeParams resumes a session without replaying its transcript.
 type SessionResumeParams struct {
@@ -333,7 +341,7 @@ type SessionResumeResult struct {
 	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 }
 
-// --- session/set_config_option ---
+// session/set_config_option
 
 // SetSessionConfigOptionParams changes one advertised session config option.
 type SetSessionConfigOptionParams struct {
@@ -365,7 +373,7 @@ type SessionConfigSelectOption struct {
 	Description string `json:"description,omitempty"`
 }
 
-// --- session/set_model ---
+// session/set_model
 
 // SetSessionModelParams is ACP's legacy model-switching request.
 type SetSessionModelParams struct {
@@ -376,7 +384,7 @@ type SetSessionModelParams struct {
 // SetSessionModelResult is the empty ack for legacy model switching.
 type SetSessionModelResult struct{}
 
-// --- session/list ---
+// session/list
 
 // SessionListParams lists known sessions, optionally filtered by cwd.
 type SessionListParams struct {
@@ -400,7 +408,7 @@ type SessionInfo struct {
 	Meta      map[string]any `json:"_meta,omitempty"`
 }
 
-// --- session/close ---
+// session/close
 
 // SessionCloseParams closes an active session and releases its resources.
 type SessionCloseParams struct {
@@ -410,7 +418,7 @@ type SessionCloseParams struct {
 // SessionCloseResult is the empty close ack.
 type SessionCloseResult struct{}
 
-// --- session/delete ---
+// session/delete
 
 // SessionDeleteParams removes a session from future session/list results.
 type SessionDeleteParams struct {
@@ -420,7 +428,7 @@ type SessionDeleteParams struct {
 // SessionDeleteResult is the empty delete ack.
 type SessionDeleteResult struct{}
 
-// --- content blocks (inbound prompt) ---
+// content blocks (inbound prompt)
 
 // ContentBlock is one piece of a prompt. The agent reads text blocks and the
 // inline text of resource blocks (embeddedContext); image/audio are accepted on
@@ -461,7 +469,7 @@ func FlattenPrompt(blocks []ContentBlock) string {
 	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
-// --- session/prompt ---
+// session/prompt
 
 // SessionPromptParams sends a turn's prompt to a session.
 type SessionPromptParams struct {
@@ -476,11 +484,61 @@ type SessionSteerParams struct {
 	Prompt    []ContentBlock `json:"prompt"`
 }
 
-// SessionSteerResult acknowledges that the active turn accepted the guidance.
-type SessionSteerResult struct{}
+// SessionSteerResult acknowledges durable steer admission.
+type SessionSteerResult struct {
+	ItemID      string `json:"itemId,omitempty"`
+	Disposition string `json:"disposition,omitempty"`
+}
 
 // sessionSteerMethod follows ACP v1's reserved vendor-extension namespace.
 const sessionSteerMethod = "_reasonix.io/session/steer"
+
+const (
+	sessionInboxSchemaVersion = 1
+	sessionInboxEnqueueMethod = "_reasonix.io/session/inbox/enqueue"
+	sessionInboxListMethod    = "_reasonix.io/session/inbox/list"
+	sessionInboxGetMethod     = "_reasonix.io/session/inbox/get"
+	sessionInboxUpdateMethod  = "_reasonix.io/session/inbox/update"
+	sessionInboxDeleteMethod  = "_reasonix.io/session/inbox/delete"
+	sessionInboxMoveMethod    = "_reasonix.io/session/inbox/move"
+	sessionInboxPauseMethod   = "_reasonix.io/session/inbox/setPaused"
+	sessionInboxRetryMethod   = "_reasonix.io/session/inbox/retry"
+	sessionInboxRefreshMethod = "_reasonix.io/session/inbox/refresh"
+)
+
+// SessionInboxEnqueueParams is the durable inbox enqueue request.
+type SessionInboxEnqueueParams struct {
+	SessionID      string `json:"sessionId"`
+	Text           string `json:"text"`
+	Intent         string `json:"intent,omitempty"` // followup | steer
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
+}
+
+// SessionInboxItemParams identifies one inbox item.
+type SessionInboxItemParams struct {
+	SessionID string `json:"sessionId"`
+	ItemID    string `json:"itemId"`
+}
+
+// SessionInboxUpdateParams rewrites an item body.
+type SessionInboxUpdateParams struct {
+	SessionID string `json:"sessionId"`
+	ItemID    string `json:"itemId"`
+	Text      string `json:"text"`
+}
+
+// SessionInboxMoveParams reorders an item (toIndex is 0-based).
+type SessionInboxMoveParams struct {
+	SessionID string `json:"sessionId"`
+	ItemID    string `json:"itemId"`
+	ToIndex   int    `json:"toIndex"`
+}
+
+// SessionInboxPauseParams toggles pause.
+type SessionInboxPauseParams struct {
+	SessionID string `json:"sessionId"`
+	Paused    bool   `json:"paused"`
+}
 
 // SessionReloadExtensionsParams addresses one live ACP session.
 type SessionReloadExtensionsParams struct {
@@ -516,7 +574,7 @@ type SessionPromptResult struct {
 	TranscriptPath *string    `json:"transcriptPath,omitempty"`
 }
 
-// --- session/update (agent → client notifications) ---
+// session/update (agent → client notifications)
 //
 // SessionUpdate is a tagged union discriminated by sessionUpdate. The variants
 // reuse the JSON key "content" with two incompatible shapes (a single block for
@@ -639,7 +697,7 @@ type currentModeUpdate struct {
 	CurrentModeID string `json:"currentModeId"`
 }
 
-// --- fs/* (agent → client requests) ---
+// fs/* (agent → client requests)
 
 // FSReadTextFileParams asks the client for a file's current text, including
 // unsaved editor state. Line (1-based) and Limit page the content; Reasonix
@@ -664,7 +722,7 @@ type FSWriteTextFileParams struct {
 	Content   string `json:"content"`
 }
 
-// --- terminal/* (agent → client requests) ---
+// terminal/* (agent → client requests)
 
 // TerminalCreateParams starts a command in a client-owned terminal.
 // Env follows ACP v1's official EnvVariable[] shape (same as MCP env): only
@@ -709,14 +767,14 @@ type TerminalExitStatus struct {
 	Signal   *string `json:"signal,omitempty"`
 }
 
-// --- session/cancel (client → agent notification) ---
+// session/cancel (client → agent notification)
 
 // SessionCancelParams cancels an in-progress turn.
 type SessionCancelParams struct {
 	SessionID string `json:"sessionId"`
 }
 
-// --- session/request_permission (agent → client request) ---
+// session/request_permission (agent → client request)
 
 // PermissionOptionKind classifies an option for host UI styling. It is an ACP v1
 // wire enum, so host-visible permission choices must stay within the official

@@ -201,7 +201,7 @@ func requestContents(req provider.Request) string {
 	return b.String()
 }
 
-// --- agent.before_start ---
+// agent.before_start
 
 func TestAgentBeforeStartContinue(t *testing.T) {
 	client := &fakeDispatchClient{}
@@ -325,7 +325,7 @@ func TestSetExtensionsInstallsAfterConstruction(t *testing.T) {
 	}
 }
 
-// --- context.prepare ---
+// context.prepare
 
 func TestContextPrepareReplaceIsEphemeral(t *testing.T) {
 	client := &fakeDispatchClient{interceptFn: func(ev protocol.InterceptEvent, _ json.RawMessage) (protocol.InterceptResult, error) {
@@ -417,7 +417,7 @@ func TestContextPrepareFailurePolicy(t *testing.T) {
 	})
 }
 
-// --- provider.request ---
+// provider.request
 
 func TestProviderRequestReplace(t *testing.T) {
 	client := &fakeDispatchClient{interceptFn: func(ev protocol.InterceptEvent, payload json.RawMessage) (protocol.InterceptResult, error) {
@@ -567,7 +567,7 @@ func TestProviderRequestReplacementCacheEphemerality(t *testing.T) {
 	}
 }
 
-// --- provider.response ---
+// provider.response
 
 func TestProviderResponseReplaceIsTranscript(t *testing.T) {
 	client := &fakeDispatchClient{interceptFn: func(ev protocol.InterceptEvent, _ json.RawMessage) (protocol.InterceptResult, error) {
@@ -680,7 +680,7 @@ func TestProviderResponseFailurePolicy(t *testing.T) {
 	})
 }
 
-// --- tool.before ---
+// tool.before
 
 func TestToolBeforeContinue(t *testing.T) {
 	client := &fakeDispatchClient{}
@@ -860,7 +860,7 @@ func TestToolBeforeFailurePolicy(t *testing.T) {
 	})
 }
 
-// --- permission.decision ---
+// permission.decision
 
 func TestPermissionDecisionExtensionAllowOverridesHostDeny(t *testing.T) {
 	client := &fakeDispatchClient{interceptFn: func(ev protocol.InterceptEvent, payload json.RawMessage) (protocol.InterceptResult, error) {
@@ -995,7 +995,7 @@ func TestPermissionDecisionBlockAndFailure(t *testing.T) {
 	})
 }
 
-// --- tool.after ---
+// tool.after
 
 func TestToolAfterReplaceResult(t *testing.T) {
 	client := &fakeDispatchClient{interceptFn: func(ev protocol.InterceptEvent, _ json.RawMessage) (protocol.InterceptResult, error) {
@@ -1103,25 +1103,28 @@ func TestToolAfterFailurePolicy(t *testing.T) {
 	})
 }
 
-// --- compaction.prepare / compaction.complete ---
+// compaction.prepare / compaction.complete
 
 // newCompactionAgent builds an agent whose session has a foldable middle
 // (large assistant turns) so CompactNow always finds a region, with the
-// summarizer scripted to answer "SUMMARY TEXT".
+// summarizer scripted to answer "SUMMARY TEXT". The recent tail stays small so
+// the content-driven candidate lands well under compact_ratio and the 50% ceiling.
 func newCompactionAgent(t *testing.T, d *dispatch.Dispatcher) (*mockProvider, *Agent) {
 	t.Helper()
 	mp := &mockProvider{name: "p", chunks: []provider.Chunk{
 		{Type: provider.ChunkText, Text: "SUMMARY TEXT"}, {Type: provider.ChunkDone},
 	}}
 	sess := NewSession("sys")
-	big := strings.Repeat("a", 4000)
+	big := strings.Repeat("a", 8000)
 	sess.Add(provider.Message{Role: provider.RoleUser, Content: "task"})
 	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: big})
 	sess.Add(provider.Message{Role: provider.RoleUser, Content: "more"})
 	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: big})
-	sess.Add(provider.Message{Role: provider.RoleUser, Content: "again"})
-	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: big})
-	return mp, New(mp, tool.NewRegistry(), sess, Options{ContextWindow: 1000, Extensions: d}, event.Discard)
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "next"})
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "ok"})
+	return mp, New(mp, tool.NewRegistry(), sess, Options{
+		ContextWindow: 50_000, CompactRatio: 0.85, RecentKeep: 2, Extensions: d,
+	}, event.Discard)
 }
 
 func TestCompactionPrepareReplaceGuidance(t *testing.T) {
@@ -1141,15 +1144,13 @@ func TestCompactionPrepareReplaceGuidance(t *testing.T) {
 	if err := a.CompactNow(context.Background(), ""); err != nil {
 		t.Fatalf("CompactNow: %v", err)
 	}
-	if len(mp.requests) != 1 {
-		t.Fatalf("summarizer requests = %d, want 1", len(mp.requests))
+	for i, req := range mp.requests { // a fold too large for one call is summarized in parts
+		if sys := req.Messages[0].Content; !strings.Contains(sys, "EXTENSION GUIDANCE") {
+			t.Fatalf("summarizer call %d of %d missing the replaced guidance:\n%.200q", i+1, len(mp.requests), sys)
+		}
 	}
-	sys := mp.requests[0].Messages[0].Content
-	if !strings.Contains(sys, "EXTENSION GUIDANCE") {
-		t.Fatalf("summarizer system prompt missing the replaced guidance:\n%.200q", sys)
-	}
-	if sc := sessionContents(a.Session()); !strings.Contains(sc, "SUMMARY TEXT") {
-		t.Fatalf("session missing the summary:\n%.200q", sc)
+	if sc := joinContents(visibleContext(a)); !strings.Contains(sc, "SUMMARY TEXT") {
+		t.Fatalf("projection missing the summary:\n%.200q", sc)
 	}
 	if n := client.notifyCountFor(protocol.EventCompactionPrepare); n != 1 {
 		t.Fatalf("compaction.prepare events = %d, want 1", n)
@@ -1225,8 +1226,8 @@ func TestCompactionPrepareFailurePolicy(t *testing.T) {
 		if err := a.CompactNow(context.Background(), ""); err != nil {
 			t.Fatalf("CompactNow: %v", err)
 		}
-		if sc := sessionContents(a.Session()); !strings.Contains(sc, "SUMMARY TEXT") {
-			t.Fatalf("session missing the summary:\n%.200q", sc)
+		if sc := joinContents(visibleContext(a)); !strings.Contains(sc, "SUMMARY TEXT") {
+			t.Fatalf("projection missing the summary:\n%.200q", sc)
 		}
 		if !warns.contains("skipping this optional extension") {
 			t.Fatalf("warnings = %v, want an optional-extension skip warning", warns.msgs)
@@ -1253,9 +1254,9 @@ func TestCompactionCompleteReplace(t *testing.T) {
 	if err := a.CompactNow(context.Background(), ""); err != nil {
 		t.Fatalf("CompactNow: %v", err)
 	}
-	sc := sessionContents(a.Session())
+	sc := joinContents(visibleContext(a))
 	if !strings.Contains(sc, "EXTENSION SUMMARY") {
-		t.Fatalf("session missing the replaced summary:\n%.200q", sc)
+		t.Fatalf("projection missing the replaced summary:\n%.200q", sc)
 	}
 	if strings.Contains(sc, "SUMMARY TEXT") {
 		t.Fatalf("session leaked the original summary:\n%.200q", sc)
@@ -1731,8 +1732,8 @@ func TestCompactionCompleteSlotOwnerConsulted(t *testing.T) {
 	if err := a.CompactNow(context.Background(), ""); err != nil {
 		t.Fatalf("CompactNow: %v", err)
 	}
-	if sc := sessionContents(a.Session()); !strings.Contains(sc, "OWNER SUMMARY") {
-		t.Fatalf("session missing the owner's summary:\n%.200q", sc)
+	if sc := joinContents(visibleContext(a)); !strings.Contains(sc, "OWNER SUMMARY") {
+		t.Fatalf("projection missing the owner's summary:\n%.200q", sc)
 	}
 }
 
@@ -1765,9 +1766,9 @@ func TestCompactionCompleteSlotOwnerFinalSayAfterChain(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("owner consulted %d times, want 2 (chain, then strategy)", calls)
 	}
-	sc := sessionContents(a.Session())
+	sc := joinContents(visibleContext(a))
 	if !strings.Contains(sc, "OWNER SUMMARY") || strings.Contains(sc, "CHAIN SUMMARY") {
-		t.Fatalf("session = %.200q, want the strategy ruling persisted", sc)
+		t.Fatalf("projection = %.200q, want the strategy ruling persisted", sc)
 	}
 }
 

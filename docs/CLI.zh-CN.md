@@ -107,7 +107,7 @@ reasonix config compact-ratio 75           # 设置用户全局默认值
 reasonix config compact-ratio --local 75   # 写入 ./reasonix.toml 项目覆盖
 ```
 
-可设置范围为 65–85%，内置默认值为 80%。数值越低越早压缩，可能降低 prompt prefix
+可设置范围为 65–85%，内置默认值为 85%。数值越低越早压缩，可能降低 prompt prefix
 缓存复用率；数值越高则会在压缩前保留更多上下文。项目 `reasonix.toml` 的优先级高于
 用户全局配置。修改会应用于新启动的 CLI 会话；已经运行的会话继续使用启动时加载的阈值。
 
@@ -140,6 +140,20 @@ reasonix run --ablate evidence,planner --metrics run.json "修复失败的测试
 ```
 
 这是测量工具，不是调优开关：关掉某个子系统只会让 Reasonix 在它本来负责的工作上变差。
+
+### 轨迹记录
+
+`--trajectory PATH` 会把整次运行的完整事件流——带绝对起止时间的工具调用与结果、
+思考内容、重试、就绪与恢复决策——按每个事件一行的方式追加为带时间戳和序号的
+JSONL 记录，便于离线回放并归因时间去向（工具执行 vs. 两次调用之间的模型思考）。
+记录复用共享的 `eventwire` JSON 契约（放在 `event` 键下），外层包
+`schema_version`、`seq` 和 `ts`（unix 毫秒）。运行被杀死时已写完的行全部保留。
+与 `--events-jsonl` 不同，该文件包含提示词、工具参数和思考内容：请像对待会话
+转录一样谨慎处理。
+
+```sh
+reasonix run --metrics run.json --trajectory run.trajectory.jsonl "修复失败的测试"
+```
 
 ### 输出格式
 

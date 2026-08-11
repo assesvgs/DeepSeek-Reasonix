@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -46,19 +47,20 @@ type Message struct {
 	// Content is the provider-visible conversation content. Keeping this legacy
 	// field provider-visible preserves replay for older CLI/Desktop releases.
 	Content string `json:"content,omitempty"`
-	// RawContent is the user-authored form of a user turn, when it differs from
-	// Content because the host added transient context. Older releases ignore
-	// this field and still replay the provider-visible Content safely.
+	// RawContent holds the full original when it differs from Content:
+	// for user turns, the user-authored text before host-injected context;
+	// for tool turns, the complete tool result when first-visible Content was
+	// bounded. ModelMessages always clears it so provider serialization, prompt
+	// cache hashes, and projection hashes never include it.
 	RawContent string `json:"raw_content,omitempty"`
 	// ProviderContent is a transitional field written by early Context Engine v2
 	// builds. Loaders migrate it into Content/RawContent before normal use.
 	ProviderContent  string   `json:"provider_content,omitempty"`
 	Images           []string `json:"images,omitempty"`            // data URLs (data:<mime>;base64,…) on user (attachments) and tool (MCP image results) messages; embedded only for vision-capable models
 	ReasoningContent string   `json:"reasoning_content,omitempty"` // assistant: thinking-mode chain-of-thought, round-tripped on multi-turn
-	// ReasoningID is the provider-issued identifier of the reasoning item
-	// (OpenAI Responses schema: Reasoning.id is required on input items).
-	// Captured from the streamed output item and round-tripped back into
-	// the input on subsequent turns, matching the wire schema.
+	// ReasoningID is the provider-issued reasoning-item id (OpenAI Responses:
+	// Reasoning.id is required on input items), captured from the streamed
+	// output item and round-tripped back into later inputs.
 	ReasoningID string `json:"reasoning_id,omitempty"`
 	// ReasoningStatus is the final status of the reasoning item
 	// ("in_progress" | "completed") as issued by the server's done event,
@@ -220,6 +222,7 @@ type Request struct {
 	// output (Responses: text.format.type=json_object). Nil omits the field
 	// entirely — the common path must stay byte-stable for prompt caching.
 	ResponseFormat *ResponseFormat `json:"ResponseFormat,omitempty"`
+	EffortOverride string          `json:"EffortOverride,omitempty"` // per-call reasoning-depth override; adapters apply it only when the endpoint's effort vocabulary accepts it
 }
 
 // ResponseFormat asks a provider to constrain its output shape.
@@ -229,11 +232,26 @@ type ResponseFormat struct {
 	Type string `json:"type"`
 }
 
-// DefaultReasoningOutputTokens is the conservative provider-side budget used
-// for official reasoning APIs whose documented contract safely accepts 32K.
-// Unknown compatible gateways must opt in through configuration instead of
-// inheriting this value merely because they implement an OpenAI-shaped wire.
-const DefaultReasoningOutputTokens = 32 * 1024
+// Auto ladder for max_output_tokens=0. Bounds completion only; never compact_ratio.
+const (
+	DefaultOrdinaryOutputTokens      = 16 * 1024  // non-reasoning
+	DefaultReasoningOutputTokens     = 32 * 1024  // ordinary reasoning
+	DefaultHighReasoningOutputTokens = 64 * 1024  // high/max effort
+	DefaultHighOutputTokens          = 128 * 1024 // explicit only; never auto
+)
+
+// AutoOutputBudget maps max_output_tokens=0 to 16K/32K/64K by reasoning effort.
+func AutoOutputBudget(reasoningEnabled bool, effort string) int {
+	if !reasoningEnabled {
+		return DefaultOrdinaryOutputTokens
+	}
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "high", "max":
+		return DefaultHighReasoningOutputTokens
+	default:
+		return DefaultReasoningOutputTokens
+	}
+}
 
 // TemperaturePtr wraps v in a pointer so callers that explicitly want a
 // specific temperature, including 0 for deterministic output, can distinguish
@@ -515,7 +533,7 @@ func repairToolCallArgs(m Message) Message {
 func closeTruncatedJSON(s string) string {
 	var stack []byte
 	inStr, esc := false, false
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if inStr {
 			switch {
@@ -555,8 +573,8 @@ func closeTruncatedJSON(s string) string {
 	case strings.HasSuffix(trimmed, ":"):
 		out = trimmed + "null"
 	}
-	for i := len(stack) - 1; i >= 0; i-- {
-		out += string(stack[i])
+	for _, v := range slices.Backward(stack) {
+		out += string(v)
 	}
 	if !json.Valid([]byte(out)) {
 		return "{}"
@@ -749,9 +767,9 @@ func (u *Usage) ContextFillTokens() int {
 	return u.PromptTokens + u.CompletionTokens
 }
 
-// ContextPromptForGauge returns the latest-attempt prompt size for context
-// displays. Falls back to PromptTokens when ContextPromptTokens is unset.
-func (u *Usage) ContextPromptForGauge() int {
+// LatestPromptTokens returns the latest-attempt prompt size for context-aware
+// runtime decisions. Falls back to PromptTokens for single-attempt legacy usage.
+func (u *Usage) LatestPromptTokens() int {
 	if u == nil {
 		return 0
 	}
@@ -789,13 +807,7 @@ func (p *Pricing) Cost(u *Usage) float64 {
 	// writes or 2x 1-hour writes). Older providers leave both fields at zero and
 	// keep the legacy one-input-rate behavior. A write count without billed
 	// units also falls back to 1x for backward compatibility.
-	write := u.CacheWriteTokens
-	if write < 0 {
-		write = 0
-	}
-	if write > miss {
-		write = miss
-	}
+	write := min(max(u.CacheWriteTokens, 0), miss)
 	billedWrite := 0.0
 	if write > 0 {
 		billedWrite = u.CacheWriteBilledTokens

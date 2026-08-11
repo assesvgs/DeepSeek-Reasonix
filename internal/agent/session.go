@@ -3,6 +3,8 @@
 package agent
 
 import (
+	"bytes"
+	"strings"
 	"sync"
 
 	"reasonix/internal/provider"
@@ -86,6 +88,7 @@ func (s *Session) AddDecisionReceipt(receipt *provider.DecisionReceipt) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	//nolint:modernize // slices.Backward yields element copies; this body writes through the index.
 	for i := len(s.Messages) - 1; i >= 0; i-- {
 		if s.Messages[i].Role == provider.RoleUser && !s.Messages[i].LocalOnly {
 			break
@@ -123,6 +126,7 @@ func (s *Session) UpdateToolCallPreview(call provider.ToolCall) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	//nolint:modernize // slices.Backward yields element copies; this body writes through the index.
 	for i := len(s.Messages) - 1; i >= 0; i-- {
 		if s.Messages[i].Role != provider.RoleAssistant {
 			continue
@@ -159,6 +163,7 @@ func (s *Session) UpdateToolCallResolution(call provider.ToolCall) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	//nolint:modernize // slices.Backward yields element copies; this body writes through the index.
 	for i := len(s.Messages) - 1; i >= 0; i-- {
 		if s.Messages[i].Role != provider.RoleAssistant {
 			continue
@@ -243,6 +248,19 @@ func (s *Session) DrainContentRewriteReasons() []string {
 	return reasons
 }
 
+// NoteContentRewrite queues a provider-visible prefix-change reason without
+// mutating Messages. Projection installs use this so cache diagnostics still
+// attribute the next request's miss to compaction while the canonical
+// transcript stays intact.
+func (s *Session) NoteContentRewrite(reason string) {
+	if s == nil || reason == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingContentReasons = append(s.pendingContentReasons, reason)
+}
+
 // Snapshot returns a copy of the messages, safe to read from another goroutine
 // while a turn appends. Frontends (History, Save) use it instead of touching the
 // live slice.
@@ -256,6 +274,25 @@ func (s *Session) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.Messages)
+}
+
+// MessageRange returns a copy of the messages in [start, end), clamped to the
+// current log bounds, safe to read from another goroutine while a turn
+// appends. Paging frontends use it to fetch a display window without paying
+// for a Snapshot of the whole history.
+func (s *Session) MessageRange(start, end int) []provider.Message {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if start < 0 {
+		start = 0
+	}
+	if end > len(s.Messages) {
+		end = len(s.Messages)
+	}
+	if start >= end {
+		return []provider.Message{}
+	}
+	return append([]provider.Message(nil), s.Messages[start:end]...)
 }
 
 // CloneWithMessages returns a fresh Session carrying msgs while preserving the
@@ -327,6 +364,21 @@ func (s *Session) snapshotWithVersion() ([]provider.Message, uint64, int) {
 	return append([]provider.Message(nil), s.Messages...), s.version, s.rewriteVersion
 }
 
+// snapshotMessagesVersion returns a copy of the messages with the transcript
+// version, for projection validity checks that do not need rewriteVersion.
+func (s *Session) snapshotMessagesVersion() ([]provider.Message, uint64) {
+	msgs, version, _ := s.snapshotWithVersion()
+	return msgs, version
+}
+
+// TranscriptVersion returns the current append/rewrite counter used by
+// context-projection validity checks.
+func (s *Session) TranscriptVersion() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.version
+}
+
 // RewriteVersion returns the current rewrite version.
 func (s *Session) RewriteVersion() int {
 	s.mu.RLock()
@@ -342,6 +394,32 @@ func (s *Session) NeedsRewriteSave() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.rewriteVersion > s.persistedRewriteVersion
+}
+
+// HasUnsavedChanges reports whether the in-memory transcript contains storage
+// changes that have not been durably recorded at path. It is intentionally
+// conservative when no verified baseline exists: an idle controller must not
+// replace an in-memory conversation with a possibly older disk copy after a
+// bounded lock failure or an interrupted save.
+func (s *Session) HasUnsavedChanges(path string) bool {
+	if s == nil || strings.TrimSpace(path) == "" {
+		return false
+	}
+	msgs, _, rewriteVersion := s.snapshotWithVersion()
+	digest, err := digestSessionMessages(msgs)
+	if err != nil {
+		return true
+	}
+	key := canonicalSessionSavePath(path)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.persisted.ok || s.persisted.path != key {
+		return true
+	}
+	if s.normalizedDirty || s.eventLogDamaged || rewriteVersion > s.persistedRewriteVersion {
+		return true
+	}
+	return !bytes.Equal(digest[:], s.persisted.digest[:])
 }
 
 // IncrementRewrite bumps the rewrite version by 1.

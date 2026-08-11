@@ -126,19 +126,25 @@ func New(cfg Config) provider.Provider {
 	vendor := DetectVendor(cfg.BaseURL)
 	cap := capabilitiesFor(vendor)
 	maxOutputTokens := cfg.MaxOutputTokens
-	// 默认输出预算从 vendor 表取（deepseek 32K / mimo 64K）——消除硬编码
-	// 常量分叉（review：responses.go 硬编码与 caps.defaultMaxOutputTokens
-	// 职责重叠）。条件保留：thinking-disabled 的 deepseek 请求不设自动
-	// 预算（与 openai.go 一致——服务端默认即可；测试断言该行为）。
-	if maxOutputTokens == 0 && cap.defaultMaxOutputTokens > 0 &&
-		!(vendor == "deepseek" && responsesReasoningDisabled(cfg.Effort)) {
-		maxOutputTokens = cap.defaultMaxOutputTokens
+	// max_output_tokens=0 is automatic. Known vendors use the 16K/32K/64K ladder;
+	// thinking-disabled DeepSeek still gets the ordinary 16K auto budget.
+	// 128K is never chosen automatically. Compact_ratio is independent.
+	if maxOutputTokens == 0 && cap.defaultMaxOutputTokens > 0 {
+		if vendor == "deepseek" || vendor == "mimo" {
+			maxOutputTokens = responsesAutoOutputBudget(vendor, cfg.Effort)
+		} else {
+			maxOutputTokens = cap.defaultMaxOutputTokens
+		}
 	}
 	sessionCache := cap.sessionCacheHeader
 	if cfg.SessionCache != nil {
 		sessionCache = *cfg.SessionCache
 	}
 	vision, _ := cfg.Extra["vision"].(bool)
+	// DeepSeek's official Responses endpoint is currently text-only. Keep this
+	// provider-boundary guard so stale config or extension metadata cannot emit
+	// unsupported input_image items.
+	vision = vision && vendor != "deepseek"
 	httpClient := &http.Client{Timeout: 300 * time.Second}
 	if built, err := netclient.NewHTTPClient(cfg.Proxy, netclient.TransportOptions{
 		DialTimeout: 30 * time.Second, KeepAlive: 30 * time.Second,
@@ -162,6 +168,20 @@ func responsesReasoningDisabled(effort string) bool {
 	default:
 		return false
 	}
+}
+
+// responsesAutoOutputBudget mirrors Chat Completions: DeepSeek defaults empty
+// effort to high (64K), low stays 32K, thinking disabled is ordinary 16K.
+// Never auto-selects 128K.
+func responsesAutoOutputBudget(vendor, effort string) int {
+	if responsesReasoningDisabled(effort) {
+		return provider.AutoOutputBudget(false, effort)
+	}
+	e := strings.ToLower(strings.TrimSpace(effort))
+	if vendor == "deepseek" && (e == "" || e == "auto") {
+		e = "high"
+	}
+	return provider.AutoOutputBudget(true, e)
 }
 
 func (c *client) Name() string { return c.name }
@@ -288,9 +308,9 @@ func (c *client) buildRequestBody(req provider.Request) (map[string]any, bool, [
 		maxOutputTokens = c.maxOutputTokens
 	}
 	if maxOutputTokens == 0 && c.caps.defaultMaxOutputTokens > 0 {
-		// 与 New() 构造期默认同条件：thinking-disabled 的 deepseek 请求
-		// 不设自动预算（服务端默认即可——测试断言该行为）。
-		if !(c.vendor == "deepseek" && responsesReasoningDisabled(c.effort)) {
+		if c.vendor == "deepseek" || c.vendor == "mimo" {
+			maxOutputTokens = responsesAutoOutputBudget(c.vendor, c.effort)
+		} else {
 			maxOutputTokens = c.caps.defaultMaxOutputTokens
 		}
 	}
@@ -343,7 +363,7 @@ func (c *client) buildRequestBody(req provider.Request) (map[string]any, bool, [
 		return body, true, messages
 	}
 
-	body["input"] = messagesToInput(rest, c.vision, c.vendor == "deepseek", c.caps.summaryRequired)
+	body["input"] = messagesToInput(rest, c.vision, c.webSearch, c.caps.summaryRequired)
 	return body, false, messages
 }
 
@@ -354,7 +374,7 @@ func splitInstructions(messages []provider.Message) (string, []provider.Message)
 	return messages[0].Content, messages[1:]
 }
 
-func messagesToInput(messages []provider.Message, vision, replayDeepSeekItems, summary bool) []map[string]any {
+func messagesToInput(messages []provider.Message, vision, replayWebSearchItems, summary bool) []map[string]any {
 	input := make([]map[string]any, 0, len(messages)*2)
 	for _, message := range messages {
 		switch message.Role {
@@ -404,7 +424,7 @@ func messagesToInput(messages []provider.Message, vision, replayDeepSeekItems, s
 				}
 				input = append(input, item)
 			}
-			if replayDeepSeekItems {
+			if replayWebSearchItems {
 				for _, raw := range message.ResponsesItems {
 					if item, ok := decodeReplayableWebSearchItem(raw); ok {
 						input = append(input, item)
@@ -454,7 +474,7 @@ func (c *client) conversationDigest(messages []provider.Message) string {
 	payload, _ := json.Marshal(struct {
 		Instructions string           `json:"instructions,omitempty"`
 		Input        []map[string]any `json:"input"`
-	}{Instructions: instructions, Input: messagesToInput(rest, c.vision, c.vendor == "deepseek", c.caps.summaryRequired)})
+	}{Instructions: instructions, Input: messagesToInput(rest, c.vision, c.webSearch, c.caps.summaryRequired)})
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
 }
@@ -613,7 +633,7 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 				}
 			}
 		case "response.output_item.done":
-			if event.Item != nil && event.Item.Type == "web_search_call" && c.vendor == "deepseek" {
+			if event.Item != nil && event.Item.Type == "web_search_call" && c.webSearch {
 				if _, ok := decodeReplayableWebSearchItem(event.Item.Raw); ok {
 					key := event.Item.ID
 					if key == "" {
@@ -774,6 +794,7 @@ func sendChunk(ctx context.Context, out chan<- provider.Chunk, chunk provider.Ch
 		return true
 	default:
 	}
+	notifySendChunkEnterBlocking()
 	select {
 	case out <- chunk:
 		return true
@@ -795,10 +816,7 @@ func usageFromResponse(response *sseResponse) *provider.Usage {
 	if u.OutputTokensDetails != nil {
 		reasoning = u.OutputTokensDetails.ReasoningTokens
 	}
-	miss := u.InputTokens - cached
-	if miss < 0 {
-		miss = 0
-	}
+	miss := max(u.InputTokens-cached, 0)
 	total := u.TotalTokens
 	if total == 0 {
 		total = u.InputTokens + u.OutputTokens

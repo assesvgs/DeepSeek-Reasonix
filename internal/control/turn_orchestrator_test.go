@@ -343,7 +343,7 @@ func (r *deliveryScopeErrorRunner) Run(ctx context.Context, _ string) error {
 	return &agent.FinalReadinessError{Attempts: 1, Reason: "missing verification", Missing: []string{"verification"}}
 }
 
-func TestGoalReadinessFailureContinuesThenPausesOnNoProgress(t *testing.T) {
+func TestGoalReadinessFailureContinuesThenPausesOnTurnBudget(t *testing.T) {
 	runner := &deliveryScopeErrorRunner{}
 	executor := agent.New(nil, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
 	c := New(Options{Runner: runner, Executor: executor})
@@ -351,16 +351,16 @@ func TestGoalReadinessFailureContinuesThenPausesOnNoProgress(t *testing.T) {
 
 	err := newTurnOrchestrator(c).runGoalLoopWithRawDisplay(context.Background(), "start", "start", "")
 	if err != nil {
-		t.Fatalf("run err = %v, want the loop to absorb FinalReadinessError and pause on no-progress", err)
+		t.Fatalf("run err = %v, want the loop to absorb FinalReadinessError and pause on the turn budget", err)
 	}
 	// The FSM absorbs the readiness failure and continues with the missing
-	// requirements; with no host-verifiable progress across turns the
-	// no-progress gate pauses the goal instead of looping forever.
+	// requirements; cross-turn no-progress remains observational and the outer
+	// continuation backstop eventually pauses the goal.
 	if got := c.GoalStatus(); got != GoalStatusBlocked {
-		t.Fatalf("GoalStatus = %q, want blocked (no-progress pause)", got)
+		t.Fatalf("GoalStatus = %q, want blocked (turn-budget pause)", got)
 	}
-	if rt := c.GoalRuntime(); rt.StopCause != stopCauseNoProgress {
-		t.Fatalf("stop cause = %q, want %q", rt.StopCause, stopCauseNoProgress)
+	if rt := c.GoalRuntime(); rt.StopCause != stopCauseBudgetTurns {
+		t.Fatalf("stop cause = %q, want %q", rt.StopCause, stopCauseBudgetTurns)
 	}
 	if len(runner.scopes) < 2 || runner.scopes[0].ID == "" || runner.scopes[0].TaskText != "ship the integration" {
 		t.Fatalf("delivery scopes = %+v, want scoped continuation turns", runner.scopes)
@@ -797,7 +797,7 @@ func TestTurnOrchestratorStopFailureHookCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	o := newTurnOrchestrator(c)
-	if err := o.runTurnWithRawDisplay(ctx, "test", "test", ""); err != nil && err != context.Canceled {
+	if err := o.runTurnWithRawDisplay(ctx, "test", "test", ""); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if stopCalls != 1 {
@@ -921,7 +921,7 @@ func TestTurnOrchestratorInterruptedAfterCompactionRelocatesVisibleTurn(t *testi
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sess := agent.NewSession("system")
-			for i := 0; i < 3; i++ {
+			for range 3 {
 				sess.Add(provider.Message{Role: provider.RoleUser, Content: "old task"})
 				sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "old answer"})
 			}
@@ -1011,12 +1011,12 @@ func TestTurnOrchestratorCancelBeforeRunnerAddsUserPreservesVisiblePrompt(t *tes
 	c.canceling = true
 	c.mu.Unlock()
 
-	err := newTurnOrchestrator(c).runTurnWithRawDisplay(context.Background(), "inspect @diagram.png", "inspect @diagram.png", "")
+	err := newTurnOrchestrator(c).runTurnWithImageRefsRawDisplay(context.Background(), "Referenced context:\n\n<image path=\"diagram.png\">\n@diagram.png\n</image>\n\ninspect the diagnostic", "inspect the diagnostic", "@diagram.png", "")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 	msgs := sess.Snapshot()
-	if len(msgs) != 3 || msgs[1].Role != provider.RoleUser || msgs[1].Content != "inspect @diagram.png" || !msgs[2].LocalOnly {
+	if len(msgs) != 3 || msgs[1].Role != provider.RoleUser || !strings.Contains(msgs[1].Content, "inspect the diagnostic") || !msgs[2].LocalOnly {
 		t.Fatalf("session after pre-executor cancel = %+v, want user plus recovery marker", msgs)
 	}
 	if len(msgs[1].Images) != 1 || !strings.HasPrefix(msgs[1].Images[0], "data:image/png;base64,") {

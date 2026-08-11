@@ -1,11 +1,5 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { ShellExpandProvider, useShellExpand } from "./lib/shellExpand";
-import gsap from "gsap";
-import { useGSAP } from "@gsap/react";
-import { Flip } from "gsap/Flip";
-import { ScrollToPlugin } from "gsap/ScrollToPlugin";
-gsap.registerPlugin(useGSAP, Flip, ScrollToPlugin);
 import {
   Activity,
   CircleHelp,
@@ -42,15 +36,14 @@ import { useToast } from "./lib/toast";
 import { useGoalActionHandler } from "./lib/goalAction";
 import { useWailsResizeFix } from "./lib/useWailsResizeFix";
 import { asArray } from "./lib/array";
-import { createBoundedRefreshCoordinator, sameTabMetaLists, shouldRefreshTabMetaForEvent, TAB_META_MAX_IN_FLIGHT, tabMetaFallbackDelay } from "./lib/tabMetaRefresh";
+import { createBoundedRefreshCoordinator, sameTabMetaLists, shouldRefreshTabMetaForEvent, TAB_META_MAX_IN_FLIGHT } from "./lib/tabMetaRefresh";
 import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, t, useI18n, useT, type Translator } from "./lib/i18n";
 import { localizedNoticeText, useController, type Item, type LiveStream } from "./lib/useController";
-import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered, openExternal } from "./lib/bridge";
+import { app, onEvent, onProjectTreeChanged, onReady, onRemoteForwards, onRemoteServer, onRemoteStatus, onRuntimeRebuilt, onSessionRecovered, openExternal } from "./lib/bridge";
 import { generativeMusic, isGenerativeMusicEnabled } from "./lib/generative-music";
 import { clearAttentionChimeKeys, playAttentionChime, playSuccessChime, shouldPlayAttentionChimeForEvent } from "./lib/sound";
 import { NoticeCard, Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
-import { TranscriptSelectionMenu } from "./components/TranscriptSelectionMenu";
 import { TodoPanel } from "./components/TodoPanel";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { AskCard } from "./components/AskCard";
@@ -60,19 +53,18 @@ import { RuntimeDecisionCard } from "./components/RuntimeDecisionCard";
 import { decisionSurfaceMockFromInput, type DecisionSurfaceKind as MockDecisionSurfaceKind } from "./lib/decisionSurfaceMock";
 
 const UndoRewindBanner = lazy(() => import("./components/UndoRewindBanner").then((module) => ({ default: module.UndoRewindBanner })));
+const WebView2ApprovalSmoke = lazy(() => import("./lib/useWebView2ApprovalSmoke").then((module) => ({ default: module.WebView2ApprovalSmoke })));
 
 /** Footer decision surface kinds. Runtime blockers are explicit recovery choices. */
 type DecisionSurfaceKind = MockDecisionSurfaceKind | "extension_form";
 import { StatusBar } from "./components/StatusBar";
 import { RemoteHostKeyDialog } from "./components/RemoteHostKeyDialog";
 import { RemoteSecretDialog } from "./components/RemoteSecretDialog";
-import { onRemoteStatus, onRemoteForwards, onRemoteServer } from "./lib/bridge";
 import { RemoteConnectionTimeoutError, useRemoteStore, waitForRemoteConnection } from "./store/remote";
 import { RemoteWorkspaceLaunchGate, resolveRemoteWorkspace } from "./lib/remoteWorkspace";
 import { CommandPalette, type PaletteItem } from "./components/CommandPalette";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { UpdaterProvider } from "./lib/useUpdater";
-import { ContextPanel } from "./components/ContextPanel";
 import { Tooltip } from "./components/Tooltip";
 import { StartupSplash } from "./components/StartupSplash";
 import { OnboardingOverlay } from "./components/OnboardingOverlay";
@@ -84,11 +76,12 @@ import { WorktreeBadge } from "./components/WorktreeBadge";
 import { HeartbeatPanel } from "./custom/features/heartbeat/HeartbeatPanel";
 import "./custom/features/heartbeat/heartbeat.css";
 import { CopyButton } from "./components/CopyButton";
-import { ExternalOpener } from "./components/ExternalOpener";
+import { ExternalOpener, shouldMountExternalOpener } from "./components/ExternalOpener";
 import { startTerminalEventBridge } from "./lib/terminalEvents";
 import { applyTerminalThemePreference } from "./lib/terminalTheme";
 import { formatTerminalOutputForComposer } from "./lib/terminalOutput";
 import { useTerminalStore } from "./store/terminal";
+import { hydrateReasoningDisplayMode, setReasoningDisplayPending } from "./lib/reasoningDisplayPreference";
 import { parseTodos } from "./lib/tools";
 import {
   dismissedTodoKeyForScope,
@@ -209,11 +202,18 @@ import { useViewportHeightVar, useWindowStatePersistence } from "./lib/windowSta
 import { availableWorkspacePanelWidth, resolveLiveWorkspacePanelWidth, resolveWorkspacePanelWidth, workspacePanelAriaMinWidth } from "./lib/workspaceLayout";
 import { createRafResizeUpdater } from "./lib/resizeDrag";
 import { useGlobalShortcut } from "./lib/keyboardShortcuts";
+import { useMountTransition } from "./lib/useMountTransition";
 import { topicShortcutIndexFromEvent, useTopicShortcuts, type TopicShortcutEntry } from "./lib/topicShortcuts";
 import { composerDraftKeyForTab } from "./lib/composerDraftKey";
 import { continueDelivery } from "./lib/deliveryContinue";
 import { activateGoalAndSubmitOnTab } from "./lib/goalSubmit";
 import logoWordmark from "./assets/logo-wordmark.svg";
+
+// Hold reasoning UI until the authoritative desktop startup settings arrive;
+// this prevents a hidden preference from flashing content during first paint.
+setReasoningDisplayPending();
+
+const TERMINAL_CLOSE_TRANSITION_MS = 250;
 
 function noticePreviewMockEnabled(): boolean {
   const value = browserMockScenarioParam();
@@ -257,8 +257,6 @@ function noticePreviewItems(): Item[] {
     notice(8, "info", "Context was compacted without a generated summary.", "compaction completed after upstream summary generation returned empty content; retained transcript checkpoint"),
     notice(9, "info", "Goal is not ready to complete yet; continuing the remaining work.", "goal completion check found pending validation: desktop/frontend typecheck"),
     notice(13, "info", "Goal still has unfinished task state; continuing the remaining work.", "active goal has open task state: implement preview, verify browser, report result"),
-    notice(14, "warn", "AutoResearch status update failed.", "autoresearch task completion update failed: write .reasonix/autoresearch/task-42/state/task_spec.json: permission denied"),
-    notice(15, "warn", "AutoResearch task marked blocked.", "autoresearch task blocked: task-42\nreason: missing accepted verification evidence after three turns"),
     notice(16, "warn", "background export failed: needs attention", "background export failed: session archive upload returned 503 after 3 retries"),
     notice(17, "warn", "Job artifact migration failed.", "artifact migration failed for job job_123: checksum mismatch while moving output.zip"),
     notice(18, "warn", "Background job teardown timed out.", "job job_123 did not stop within 10s; process is still marked running by the supervisor"),
@@ -293,6 +291,8 @@ function NoticePreviewPanel() {
   );
 }
 
+const TranscriptSelectionMenu = lazy(() => import("./components/TranscriptSelectionMenu").then((module) => ({ default: module.TranscriptSelectionMenu })));
+const ContextPanel = lazy(() => import("./components/ContextPanel").then((module) => ({ default: module.ContextPanel })));
 const HistoryPanel = lazy(() => import("./components/HistoryPanel").then((module) => ({ default: module.HistoryPanel })));
 const SettingsPanel = lazy(() => import("./components/SettingsPanelEntry").then((module) => ({ default: module.SettingsPanel })));
 const RemotePanel = lazy(() => import("./components/RemotePanel").then((module) => ({ default: module.RemotePanel })));
@@ -304,7 +304,7 @@ const CHAT_MIN_WIDTH = 400;
 const CHAT_COMFORT_MIN_WIDTH = 560;
 const WORKSPACE_RESIZER_WIDTH = 8;
 
-function stripGoalResearchFlags(arg: string): string {
+function stripLegacyGoalBudgetFlags(arg: string): string {
   const parts = arg.trim().split(/\s+/).filter(Boolean);
   while (parts.length > 0) {
     const flag = parts[0].toLowerCase();
@@ -314,7 +314,7 @@ function stripGoalResearchFlags(arg: string): string {
   return parts.join(" ");
 }
 
-function hasGoalResearchFlag(arg: string): boolean {
+function hasLegacyGoalBudgetFlag(arg: string): boolean {
   const first = arg.trim().split(/\s+/, 1)[0]?.toLowerCase();
   return first === "--research" || first === "--auto-research" || first === "--deep" || first === "--simple" || first === "--no-research";
 }
@@ -1229,8 +1229,8 @@ export default function App() {
   const workspaceScopeActiveTabRef = useRef(activeTabId);
   const [workspaceControllerEpoch, setWorkspaceControllerEpoch] = useState(0);
   workspaceScopeActiveTabRef.current = activeTabId;
-  // Bump dockRefreshKey after each turn so WorkspacePanel/ContextPanel re-fetch
-  // workspace changes, git history, and session metadata after AI tool writes.
+  // ContextPanel still uses this turn sequence for usage/session metadata;
+  // WorkspacePanel listens to resource-level workspace revisions instead.
   useEffect(() => {
     startTerminalEventBridge();
     const unsub = onEvent((e) => {
@@ -1273,7 +1273,6 @@ export default function App() {
   const [workspacePanelResizing, setWorkspacePanelResizing] = useState(false);
   const [liveWorkspacePanelRenderWidth, setLiveWorkspacePanelRenderWidth] = useState<number | null>(null);
   const [liveTerminalHeight, setLiveTerminalHeight] = useState<number | null>(null);
-  const [terminalContentVisible, setTerminalContentVisible] = useState(false);
   const terminalResizing = liveTerminalHeight !== null;
   const workspacePanelMaximized = useLayoutStore((s) => s.workspacePanelMaximized);
   const setWorkspacePanelMaximized = useLayoutStore((s) => s.setWorkspacePanelMaximized);
@@ -1281,6 +1280,10 @@ export default function App() {
   const setRightDockMode = useLayoutStore((s) => s.setRightDockMode);
   const terminalPanelOpen = useLayoutStore((s) => s.terminalPanelOpen);
   const setTerminalPanelOpen = useLayoutStore((s) => s.setTerminalPanelOpen);
+  const { mounted: terminalContentVisible } = useMountTransition(
+    terminalPanelOpen,
+    TERMINAL_CLOSE_TRANSITION_MS,
+  );
   const terminalHeight = useLayoutStore((s) => s.terminalHeight);
   const setTerminalHeight = useLayoutStore((s) => s.setTerminalHeight);
   const [dockRefreshKey, setDockRefreshKey] = useState(0);
@@ -1494,7 +1497,7 @@ export default function App() {
   }, []);
 
   const applyDesktopPreferences = useCallback(
-    (settings: Pick<SettingsView, "desktopTheme" | "desktopThemeStyle" | "desktopTerminalTheme" | "desktopLayoutStyle" | "desktopLanguage" | "checkUpdates" | "statusBarStyle" | "statusBarItems" | "conversationWidth">) => {
+    (settings: Pick<SettingsView, "desktopTheme" | "desktopThemeStyle" | "desktopTerminalTheme" | "desktopLayoutStyle" | "desktopLanguage" | "checkUpdates" | "statusBarStyle" | "statusBarItems" | "conversationWidth"> & { reasoningDisplayMode?: string; reasoningDisplayModeExplicit?: boolean }) => {
       const nextTheme = normalizeThemePreference(settings.desktopTheme);
       const nextStyle = normalizeThemeStyleForTheme(settings.desktopThemeStyle, nextTheme);
       applyConfiguredBaseAppearance(nextTheme, nextStyle);
@@ -1507,11 +1510,13 @@ export default function App() {
       setStartupUpdateChecksEnabled(settings.checkUpdates !== false);
       setStatusBarStyle(settings.statusBarStyle === "text" ? "text" : "icon");
       setStatusBarItems(normalizeStatusBarItems(settings.statusBarItems));
+      hydrateReasoningDisplayMode(settings.reasoningDisplayMode, settings.reasoningDisplayModeExplicit === true);
     },
     [setLocalePref],
   );
 
   useEffect(() => {
+    setReasoningDisplayPending();
     let cancelled = false;
     const syncDesktopPreferences = async () => {
       const legacyLanguage = readLegacyLangPref();
@@ -1558,6 +1563,7 @@ export default function App() {
     void syncDesktopPreferences().catch((e) => {
       console.warn("desktop preferences sync failed", e);
       setStartupUpdateChecksEnabled(true);
+      hydrateReasoningDisplayMode("auto", false);
     });
     return () => {
       cancelled = true;
@@ -2385,9 +2391,9 @@ export default function App() {
       const goalCommand = /^\/goal(?:\s+(.*))?$/.exec(trimmed);
       if (goalCommand) {
         const arg = (goalCommand[1] ?? "").trim();
-        const displayGoal = stripGoalResearchFlags(arg);
+        const displayGoal = stripLegacyGoalBudgetFlags(arg);
         if (displayGoal && !["status", "clear", "off", "stop", "done"].includes(displayGoal.toLowerCase())) {
-          if (hasGoalResearchFlag(arg)) {
+          if (hasLegacyGoalBudgetFlag(arg)) {
             userPlanModeByTabRef.current = updateUserPlanModeIntent(userPlanModeByTabRef.current, activeTabId, false);
             patchActiveComposerProfile({
               collaborationMode: "goal",
@@ -2594,43 +2600,20 @@ export default function App() {
   }, [activeTab?.scope, activeTab?.workspaceRoot]);
 
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    const schedule = () => {
-      if (cancelled) return;
-      timer = window.setTimeout(() => {
-        void refreshTabMetas();
-        schedule();
-      }, tabMetaFallbackDelay(document.visibilityState));
-    };
-    const refreshAndSchedule = () => {
-      if (timer !== undefined) window.clearTimeout(timer);
-      timer = undefined;
-      void refreshTabMetas();
-      schedule();
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") refreshAndSchedule();
-      else {
-        if (timer !== undefined) window.clearTimeout(timer);
-        schedule();
-      }
-    };
-    refreshAndSchedule();
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
-  }, [refreshTabMetas]);
-
-  useEffect(() => {
-    return onProjectTreeChanged(() => {
+    let live = true;
+    const ready = import("./lib/workspaceRefreshStore")
+      .then(({ default: startWorkspaceFocusReconciliation }) => live ? startWorkspaceFocusReconciliation(activeTabId, workspaceScopeKey, refreshTabMetas) : undefined)
+      .catch(() => undefined);
+    const stopProjectTree = onProjectTreeChanged(() => {
       setProjectRevision((value) => value + 1);
       void refreshTabMetas(undefined, { afterMutation: true });
     });
-  }, [refreshTabMetas]);
+    return () => {
+      live = false;
+      stopProjectTree();
+      void ready.then((stop) => stop?.());
+    };
+  }, [activeTabId, refreshTabMetas, workspaceScopeKey]);
 
   // Bridge remote:* events into the remote store once, app-wide, so the
   // StatusBar chip, host manager, and explorer all see the same live state.
@@ -3003,21 +2986,6 @@ export default function App() {
     },
     [setSavedTerminalHeight, terminalPanelOpen, terminalRenderHeight, terminalResizeMaxHeight],
   );
-
-  // Manage terminal content visibility for open/close animation.
-  // On open: mount content immediately. On close: wait for the grid-template-rows
-  // transition to finish before unmounting.
-  const handleTerminalTransitionEnd = useCallback((event: React.TransitionEvent<HTMLDivElement>) => {
-    if (event.propertyName === "grid-template-rows" && !terminalPanelOpen) {
-      setTerminalContentVisible(false);
-    }
-  }, [terminalPanelOpen]);
-
-  useEffect(() => {
-    if (terminalPanelOpen) {
-      setTerminalContentVisible(true);
-    }
-  }, [terminalPanelOpen]);
 
   const openWorkspacePanel = useCallback(
     (mode: RightDockMode = rightDockMode) => {
@@ -4331,6 +4299,7 @@ export default function App() {
   return (
     <ShellExpandProvider>
     <UpdaterProvider>
+    {window.__REASONIX_WEBVIEW2_APPROVAL_SMOKE__ === true && <Suspense fallback={null}><WebView2ApprovalSmoke activeTabId={activeTabId} approval={state.approval} /></Suspense>}
     <ShellHotkeys />
     <TextSizeHotkeys />
       <div
@@ -4367,7 +4336,6 @@ export default function App() {
           .filter(Boolean)
           .join(" ")}
         style={layoutStyle}
-        onTransitionEnd={handleTerminalTransitionEnd}
       >
         {!appChromeHidden && (
           <AppChrome
@@ -4722,8 +4690,8 @@ export default function App() {
             </div>
             <div className="topicbar__spacer" />
             <div className="topicbar__actions">
-              {sidebarCreation && !sidebarImDetailConnection && activeTab?.scope === "project" && (
-                <ExternalOpener tabId={activeTab.id} dismissSignal={transientOverlayDismissSignal} />
+              {sidebarCreation && shouldMountExternalOpener(activeTab, Boolean(sidebarImDetailConnection)) && activeTab && (
+                <ExternalOpener key={activeTab.id} tabId={activeTab.id} dismissSignal={transientOverlayDismissSignal} />
               )}
               {!sidebarImDetailConnection && (
               <>
@@ -4799,8 +4767,8 @@ export default function App() {
                   </button>
                 </Tooltip>
               )}
-              {!sidebarCreation && !sidebarImDetailConnection && activeTab?.scope === "project" && (
-                <ExternalOpener tabId={activeTab.id} dismissSignal={transientOverlayDismissSignal} />
+              {!sidebarCreation && shouldMountExternalOpener(activeTab, Boolean(sidebarImDetailConnection)) && activeTab && (
+                <ExternalOpener key={activeTab.id} tabId={activeTab.id} dismissSignal={transientOverlayDismissSignal} />
               )}
               <Tooltip label={t("shortcuts.cheatsheetTitle")}>
                 <button
@@ -5221,6 +5189,11 @@ export default function App() {
               turnWaitAccumMs={state.turnWaitAccumMs}
               promptWaitStartedAt={state.promptWaitStartedAt}
               turnTokens={state.turnTokens}
+              turnOutputTokens={state.turnOutputTokens}
+              turnOutputCharsAtUsage={state.turnOutputCharsAtUsage}
+              turnModelActiveAt={state.turnModelActiveAt}
+              turnModelActiveMs={state.turnModelActiveMs}
+              liveStore={liveStore}
               turnArgChars={state.turnArgChars}
               retry={state.retry}
               suspendedByDecision={Boolean(decisionSurface)}
@@ -5324,21 +5297,23 @@ export default function App() {
                   <RemotePanel onClose={() => setWorkspacePanel(false)} />
                 </Suspense>
               ) : rightDockMode === "context" && desktopLayoutStyle !== "creation" ? (
-                <ContextPanel
-                  tabId={activeTabId}
-                  context={state.context}
-                  usage={state.usage}
-                  sessionTokens={state.sessionTokens}
-                  sessionCost={state.sessionCost}
-                  sessionCurrency={state.sessionCurrency}
-                  sessionTurns={sessionTurns}
-                  turnTokens={state.turnTotalTokens}
-                  turnCost={state.turnCost}
-                  balance={state.balance}
-                  sessionGen={state.sessionGen}
-                  refreshKey={dockRefreshKey + state.contextPanelSeq}
-                  usageSeq={state.usageSeq}
-                />
+                <Suspense fallback={null}>
+                  <ContextPanel
+                    tabId={activeTabId}
+                    context={state.context}
+                    usage={state.usage}
+                    sessionTokens={state.sessionTokens}
+                    sessionCost={state.sessionCost}
+                    sessionCurrency={state.sessionCurrency}
+                    sessionTurns={sessionTurns}
+                    turnTokens={state.turnTotalTokens}
+                    turnCost={state.turnCost}
+                    balance={state.balance}
+                    sessionGen={state.sessionGen}
+                    refreshKey={dockRefreshKey + state.contextPanelSeq}
+                    usageSeq={state.usageSeq}
+                  />
+                </Suspense>
               ) : (
                 <Suspense fallback={null}>
                   <WorkspacePanel
@@ -5362,7 +5337,6 @@ export default function App() {
                     onFileTreeRefresh={refreshComposerFileRefs}
                     onSessionRevertCommitted={handleSessionRevertCommitted}
                     onOpenInTerminal={openTerminalForPath}
-                    refreshKey={dockRefreshKey}
                     initialViewMode={rightDockMode === "changed" ? "changed" : "files"}
                     showViewTabs={false}
                     creationMode={sidebarCreation}
@@ -5425,6 +5399,10 @@ export default function App() {
             sessionTurns={sessionTurns}
             sessionTokens={state.sessionTokens}
             turnTokens={state.turnTotalTokens}
+            lastTurnOutputTokens={state.lastTurnOutputTokens}
+            lastTurnModelMs={state.lastTurnModelMs}
+            lastTurnOutputEstimated={state.lastTurnOutputEstimated}
+            lastRequestTps={state.lastRequestTps}
             turnCost={state.turnCost}
             cost={state.sessionCost}
             currency={state.sessionCurrency}
@@ -5473,6 +5451,7 @@ export default function App() {
             initialFocus={settingsFocus ?? undefined}
             agentRunning={state.running}
             desktopPlatform={desktopPlatform}
+            activeWorkspaceKey={`${activeTab?.id ?? activeTabId ?? ""}\u0000${activeTab?.workspaceRoot ?? activeTab?.cwd ?? state.meta?.cwd ?? ""}`}
             onUseSubagent={prefillSubagentCommand}
             onClose={() => {
               setSettingsFocus(null);
@@ -5538,11 +5517,12 @@ export default function App() {
       <HeartbeatPanel open={heartbeatOpen} onClose={() => setHeartbeatOpen(false)} onOpenTopic={(scope, workspaceRoot, topicId) => {
         void handleOpenTopic(scope, workspaceRoot, topicId);
       }} />
-      <TranscriptSelectionMenu
+      <Suspense fallback={null}><TranscriptSelectionMenu
         enabled={Boolean(activeTabId && !activeTab?.readOnly && !decisionSurface && !sidebarImDetailConnection && !hydratePlaceholderActive)}
         resetKey={activeTabId ?? ""}
         onAddToChat={addSelectedTextToComposer}
       />
+      </Suspense>
       {windowsFramelessChrome && (
         <WindowsWindowControls
           maximised={mainWindowMaximised}

@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -106,20 +107,13 @@ func cliCompletionRootSpec() cliCompletionSpec {
 		completionFlag("--version -v", cliCompletionNoValue),
 	}, help)}
 
+	serveFlags := cliServeCompletionFlags(model, profile, help)
+
 	root.subcommands = []cliCompletionSpec{
 		completionSpec("run", runFlags),
 		completionSpecWithAliases("chat", []string{"code"}, interactiveFlags),
-		completionSpec("serve", []cliCompletionFlag{
-			model, profile,
-			completionFlag("--max-steps", cliCompletionStaticValue),
-			completionFlag("--addr", cliCompletionStaticValue),
-			// serve loads the path with open/loadResumableSession — file path only,
-			// not branch IDs (SessionValue would complete IDs that fail at runtime).
-			completionFlag("--resume", cliCompletionPathValue),
-			completionFlag("--auth", cliCompletionStaticValue, "none", "token", "password"),
-			completionFlag("--token --password --port-file --token-file --pid-file", cliCompletionStaticValue),
-			completionFlag("--hash-password --behind-proxy", cliCompletionNoValue), help,
-		}),
+		completionSpec("serve", serveFlags),
+		completionSpec("web", serveFlags),
 		completionSpec("setup", []cliCompletionFlag{completionFlag("--local -l", cliCompletionNoValue), help}),
 		completionSpec("config", []cliCompletionFlag{help},
 			completionSpec("auto-plan", []cliCompletionFlag{completionFlag("--local", cliCompletionNoValue), help}),
@@ -291,6 +285,18 @@ func cliCompletionRootSpec() cliCompletionSpec {
 	return root
 }
 
+func cliServeCompletionFlags(model, profile, help cliCompletionFlag) []cliCompletionFlag {
+	return []cliCompletionFlag{
+		model, profile,
+		completionFlag("--max-steps --addr", cliCompletionStaticValue),
+		// Serve/Web resume accepts file paths, not branch IDs.
+		completionFlag("--resume", cliCompletionPathValue),
+		completionFlag("--auth", cliCompletionStaticValue, "none", "token", "password"),
+		completionFlag("--token --password --port-file --token-file --pid-file", cliCompletionStaticValue),
+		completionFlag("--hash-password --behind-proxy --open --no-open", cliCompletionNoValue), help,
+	}
+}
+
 func subagentCompletionFlags(model, effort, help cliCompletionFlag) []cliCompletionFlag {
 	return []cliCompletionFlag{
 		completionFlag("--description --prompt --prompt-file --tools --color --dir", cliCompletionStaticValue),
@@ -448,10 +454,7 @@ func cliCompletionCandidatesWithValues(root cliCompletionSpec, cword int, words 
 	if cword < len(words) {
 		current = words[cword]
 	}
-	limit := cword
-	if limit > len(words) {
-		limit = len(words)
-	}
+	limit := min(cword, len(words))
 
 	ctx := &root
 	positionalSeen := false
@@ -537,10 +540,8 @@ func cliCompletionLookupFlag(spec *cliCompletionSpec, token string) (*cliComplet
 		inline = true
 	}
 	for i := range spec.flags {
-		for _, candidate := range spec.flags[i].names {
-			if candidate == name {
-				return &spec.flags[i], inline
-			}
+		if slices.Contains(spec.flags[i].names, name) {
+			return &spec.flags[i], inline
 		}
 	}
 	return nil, inline
@@ -552,10 +553,8 @@ func cliCompletionLookupSubcommand(spec *cliCompletionSpec, token string) *cliCo
 		if child.name == token {
 			return child
 		}
-		for _, alias := range child.aliases {
-			if alias == token {
-				return child
-			}
+		if slices.Contains(child.aliases, token) {
+			return child
 		}
 	}
 	return nil

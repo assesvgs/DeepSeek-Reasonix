@@ -404,6 +404,18 @@ func TestRepeatedShellCommandDoesNotAccumulateOutput(t *testing.T) {
 	}
 }
 
+func TestShellResultReplacesCappedLiveProgress(t *testing.T) {
+	m := newTestChatTUI()
+	const id = "shell-build"
+	const final = "build started\n...[truncated]...\nfinal compiler error\n"
+	m.ingestEvent(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{ID: id, Name: "bash", Args: `{"command":"build"}`}})
+	m.ingestEvent(event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: id, Output: "build started\n...[live capped]...\n"}})
+	m.ingestEvent(event.Event{Kind: event.ToolResult, Tool: event.Tool{ID: id, Name: "bash", Output: final}})
+	if got := m.shellOutputs[id]; got != final {
+		t.Fatalf("shellOutputs[%q] = %q, want bounded final result %q", id, got, final)
+	}
+}
+
 func TestCollapsedShellHintUsesKeyboardShortcutOnly(t *testing.T) {
 	m := newTestChatTUI()
 	const id = "shell-long"
@@ -488,7 +500,7 @@ func TestTodoPanelKeepsLastSuccessfulTodoWrite(t *testing.T) {
 func TestToolProgressTailCap(t *testing.T) {
 	m := newTestChatTUI()
 	m.ingestEvent(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{ID: "b1", Name: "bash", Args: `{"command":"x"}`}})
-	for i := 0; i < toolStreamTailLines+5; i++ {
+	for i := range toolStreamTailLines + 5 {
 		m.ingestEvent(event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: "b1", Output: "line" + string(rune('A'+i)) + "\n"}})
 	}
 	block := m.transcript[m.toolStreamIdx]
@@ -504,7 +516,7 @@ func TestToolProgressTailCap(t *testing.T) {
 // long stream — the fix for the O(n²)/multi-GB re-render of the full thought.
 func TestReasoningViewBounded(t *testing.T) {
 	m := newTestChatTUI()
-	for i := 0; i < 5000; i++ {
+	for range 5000 {
 		m.ingestEvent(event.Event{Kind: event.Reasoning, Text: "some thinking text token "})
 	}
 	if len(m.reasoningView) > reasoningViewMax {

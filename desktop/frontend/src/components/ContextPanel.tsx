@@ -28,7 +28,6 @@ interface ContextPanelProps {
   usageSeq?: number;
 }
 
-
 function fmtDuration(ms: number, t: Translator): string {
   if (ms <= 0) return "-";
   const totalSeconds = Math.max(1, Math.round(ms / 1000));
@@ -37,7 +36,6 @@ function fmtDuration(ms: number, t: Translator): string {
   if (minutes <= 0) return t("context.durationSeconds", { seconds });
   return t("context.durationMinutesSeconds", { minutes, seconds });
 }
-
 
 interface MetricTokenDisplay {
   display: string;
@@ -100,7 +98,7 @@ export function cacheHitTone(hitTokens: number, missTokens: number): MetricTone 
   return "warn";
 }
 
-function formatSharePercent(value: number, total: number): string {
+export function formatSharePercent(value: number, total: number): string {
   if (total <= 0 || value <= 0) return "-";
   const pct = (value / total) * 100;
   if (pct > 0 && pct < 1) return "<1%";
@@ -422,9 +420,15 @@ export function ContextPanel({
   const changedFiles = asArray(info?.changedFiles);
 
   const usagePct = windowTokens > 0 ? Math.min(100, Math.round((usedTokens / windowTokens) * 100)) : 0;
-  const compactRatio = context?.compactRatio && context.compactRatio > 0 ? context.compactRatio : 0.8;
+  const compactRatio = context?.compactRatio && context.compactRatio > 0 ? context.compactRatio : 0.85;
   const compactPct = Math.round(compactRatio * 100);
-  const compactTokens = windowTokens > 0 ? Math.round(windowTokens * compactRatio) : 0;
+  const reportedTriggerTokens = context?.maintenance?.triggerTokens ?? 0;
+  const triggerTokens = reportedTriggerTokens > 0
+    ? reportedTriggerTokens
+    : windowTokens > 0
+      ? Math.round(windowTokens * compactRatio)
+      : 0;
+  const compactTokens = triggerTokens > 0 ? triggerTokens : (windowTokens > 0 ? Math.round(windowTokens * compactRatio) : 0);
   const tokensUntilCompact = compactTokens > usedTokens ? compactTokens - usedTokens : 0;
   const breakdown = contextBreakdown(usedTokens, windowTokens, promptTokens, completionTokens, reasoningTokens);
   const eventTimes = [
@@ -613,11 +617,10 @@ export function ContextPanel({
                   </div>
                   <div className="context-panel__source-legend">
                     {sourceUsageRows.map((row) => {
-                      const sharePct = sourceTotalTokens > 0 ? (sourceTokenTotal(row) / sourceTotalTokens) * 100 : 0;
                       return (
                         <span key={row.source}>
                           <i className={`context-panel__source-dot context-panel__source-tone--${sourceTone(row.source)}`} aria-hidden="true" />
-                          {sourceLabel(row.label, t)} {sharePct > 0 ? `${sharePct.toFixed(0)}%` : "-"}
+                          {sourceLabel(row.label, t)} {formatSharePercent(sourceTokenTotal(row), sourceTotalTokens)}
                         </span>
                       );
                     })}

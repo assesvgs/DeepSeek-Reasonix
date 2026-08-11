@@ -5,6 +5,8 @@ package control
 
 import (
 	"encoding/json"
+	"fmt"
+	"slices"
 	"strings"
 
 	"reasonix/internal/event"
@@ -16,6 +18,7 @@ type seedTodo struct {
 	Content string `json:"content"`
 	Status  string `json:"status"`
 	Level   int    `json:"level,omitempty"`
+	StepID  string `json:"step_id,omitempty"`
 }
 
 // seedPlanTodos turns an approved plan into a starter task list and emits it as a
@@ -134,7 +137,7 @@ func completedPlanTodosJSON(args string) string {
 // todo_write calls as it executes.
 func parsePlanTodos(plan string) []seedTodo {
 	var todos []seedTodo
-	for _, raw := range strings.Split(plan, "\n") {
+	for raw := range strings.SplitSeq(plan, "\n") {
 		item, level, ok := listItem(raw)
 		if !ok {
 			continue
@@ -152,6 +155,12 @@ func parsePlanTodos(plan string) []seedTodo {
 	if todos[0].Level == 1 {
 		todos[0].Level = 0
 	}
+	// The markdown has no identity of its own, so the host mints one per item.
+	// Seeded ids are what let a later rewrite retitle or insert steps without
+	// detaching the completions already signed off against them.
+	for i := range todos {
+		todos[i].StepID = fmt.Sprintf("plan_step_%02d", i+1)
+	}
 	normalized := evidence.NormalizeSerialTodos(seedTodoEvidenceState(todos))
 	for i := range todos {
 		todos[i].Status = normalized[i].Status
@@ -167,6 +176,7 @@ func seedTodoEvidenceState(todos []seedTodo) []evidence.TodoItem {
 			Content: todo.Content,
 			Status:  todo.Status,
 			Level:   todo.Level,
+			StepID:  todo.StepID,
 		}
 	}
 	return state
@@ -189,8 +199,8 @@ func (c *Controller) hasTodoUpdateSince(start int) bool {
 
 func latestTodoArgsSince(msgs []provider.Message, start int) (string, bool) {
 	for i := len(msgs) - 1; i >= start; i-- {
-		for j := len(msgs[i].ToolCalls) - 1; j >= 0; j-- {
-			tc := msgs[i].ToolCalls[j]
+		for _, v := range slices.Backward(msgs[i].ToolCalls) {
+			tc := v
 			if tc.Name == "todo_write" {
 				return tc.Arguments, true
 			}

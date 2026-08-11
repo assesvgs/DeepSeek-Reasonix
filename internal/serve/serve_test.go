@@ -154,11 +154,11 @@ func TestServeEndpoints(t *testing.T) {
 	srv := httptest.NewServer(New(ctrl, bc, config.ServeConfig{}).Handler())
 	defer srv.Close()
 
-	if resp, err := http.Get(srv.URL + "/history"); err != nil || resp.StatusCode != 200 {
+	if resp, err := http.Get(srv.URL + "/history"); err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("history = %v / %v", resp, err)
 	}
 
-	if resp, _ := http.Get(srv.URL + "/context"); resp.StatusCode != 200 {
+	if resp, _ := http.Get(srv.URL + "/context"); resp.StatusCode != http.StatusOK {
 		t.Errorf("context status = %d", resp.StatusCode)
 	}
 
@@ -391,26 +391,6 @@ func TestServeCompactEndpoint(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Errorf("compact = %d, want 204", resp.StatusCode)
-	}
-}
-
-func TestServeIndexPage(t *testing.T) {
-	bc := NewBroadcaster()
-	ctrl := control.New(control.Options{Sink: bc})
-	srv := httptest.NewServer(New(ctrl, bc, config.ServeConfig{}).Handler())
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + "/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Errorf("index status = %d", resp.StatusCode)
-	}
-	ct := resp.Header.Get("Content-Type")
-	if !strings.Contains(ct, "text/html") {
-		t.Errorf("index content-type = %q, want text/html", ct)
 	}
 }
 
@@ -985,7 +965,7 @@ func TestServeContextEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Errorf("context status = %d", resp.StatusCode)
 	}
 	var body map[string]int

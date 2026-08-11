@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -169,38 +170,334 @@ func TestTUIDiagnosticsMilestoneFlushesNonEmptyLog(t *testing.T) {
 	}
 }
 
-// TestWatchdogPingKeepsIdleTUIAlive is the regression test for the watchdog
-// killing a healthy idle TUI: the stall watchdog judges liveness from
-// lastProgress, which only markProgress refreshes, and markProgress only runs
-// inside Update. While idle the bubbletea loop receives no messages at all, so
-// before watchdogPing existed an untouched TUI went silent and was killed after
-// tuiWatchdogStall. Each ping must refresh lastProgress and re-arm the next one.
-func TestWatchdogPingKeepsIdleTUIAlive(t *testing.T) {
-	d := startTUIDiagnostics(t.TempDir())
+// fakeWatchClock drives the stall watchdog without real sleeps.
+type fakeWatchClock struct {
+	now time.Time
+}
+
+func newWatchdogForTest(t *testing.T, clock *fakeWatchClock) *tuiDiagnostics {
+	t.Helper()
+	d := &tuiDiagnostics{
+		writer:    io.Discard,
+		stopWatch: make(chan struct{}),
+		phase:     watchdogBooting,
+		nowFn:     func() time.Time { return clock.now },
+		dumpFn:    func(string) {},
+		killFn:    func() {},
+		logFn:     func(string, ...any) {},
+	}
+	d.lastHeartbeat = clock.now
+	d.lastHeartbeatSource = "test_start"
 	t.Cleanup(d.Close)
+	return d
+}
 
-	m := newChatTUI(control.New(control.Options{}), "", make(chan event.Event, 1), 80)
-	m.diagnostics = d
-
-	// Simulate idling longer than the stall threshold with the keepalive ping
-	// as the only traffic, exactly what an untouched terminal produces.
-	for i := 0; i < int(tuiWatchdogStall.Seconds())+3; i++ {
-		next, cmd := m.Update(watchdogPingMsg{})
-		m = next.(chatTUI)
-		if cmd == nil {
-			t.Fatalf("ping %d: keepalive was not re-armed; idle loop would go silent", i)
-		}
-		if age := time.Duration(time.Since(monoAnchor).Nanoseconds() - d.lastProgress.Load()); age >= tuiWatchdogStall {
-			t.Fatalf("ping %d: lastProgress age %s >= stall %s; watchdog would kill the idle TUI", i, age, tuiWatchdogStall)
-		}
+func TestWatchdogIdleNeverEscalates(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	if d.phaseForTest() != watchdogIdle {
+		t.Fatalf("phase = %s, want idle", d.phaseForTest())
+	}
+	// Idle for well over the stall threshold.
+	for range 30 {
+		clock.now = clock.now.Add(time.Second)
+		d.onTick(clock.now)
+	}
+	if got := d.dumpCalls.Load(); got != 0 {
+		t.Fatalf("idle dumpCalls = %d, want 0", got)
+	}
+	if got := d.cancelCalls.Load(); got != 0 {
+		t.Fatalf("idle cancelCalls = %d, want 0", got)
+	}
+	if got := d.killCalls.Load(); got != 0 {
+		t.Fatalf("idle killCalls = %d, want 0", got)
 	}
 }
 
-// TestWatchdogTickGapSkipsSuspendedProcess verifies the stall watchdog does not
-// kill the TUI after the whole process was suspended by the OS (Android
-// backgrounding, screen off): the watchdog's own ticker stalls for far longer
-// than its 1s interval, so the wall-clock progress age is inflated by the
-// pause and must not be read as a wedged event loop.
+func TestWatchdogBootStallDumpsAndKills(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	// Stay in booting; no NoteBooted.
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now)
+	if d.dumpCalls.Load() != 1 {
+		t.Fatalf("boot dumpCalls = %d, want 1", d.dumpCalls.Load())
+	}
+	if d.killCalls.Load() != 1 {
+		t.Fatalf("boot killCalls = %d, want 1", d.killCalls.Load())
+	}
+	if d.cancelCalls.Load() != 0 {
+		t.Fatalf("boot cancelCalls = %d, want 0 (no controller)", d.cancelCalls.Load())
+	}
+	// Repeat ticks must not re-kill.
+	clock.now = clock.now.Add(time.Second)
+	d.onTick(clock.now)
+	if d.killCalls.Load() != 1 {
+		t.Fatalf("boot re-kill = %d, want 1", d.killCalls.Load())
+	}
+}
+
+func TestWatchdogRunningElapsedHeartbeatPreventsKill(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	d.NoteRunning(func() {})
+	// Simulate a long turn with a heartbeat every second.
+	for range 60 {
+		clock.now = clock.now.Add(time.Second)
+		d.NoteActiveHeartbeat("elapsed_tick")
+		d.onTick(clock.now)
+	}
+	if d.dumpCalls.Load() != 0 || d.cancelCalls.Load() != 0 || d.killCalls.Load() != 0 {
+		t.Fatalf("healthy running escalated: dump=%d cancel=%d kill=%d",
+			d.dumpCalls.Load(), d.cancelCalls.Load(), d.killCalls.Load())
+	}
+}
+
+func TestWatchdogRunningStallEscalatesDumpCancelThenKill(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	cancelCh := make(chan struct{}, 1)
+	d.NoteRunning(func() {
+		select {
+		case cancelCh <- struct{}{}:
+		default:
+		}
+	})
+
+	// Stall for 10s with no heartbeat.
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now)
+	if d.dumpCalls.Load() != 1 {
+		t.Fatalf("stall dumpCalls = %d, want 1", d.dumpCalls.Load())
+	}
+	// Cancel is invoked from a goroutine; wait briefly via channel without sleep-loops
+	// that depend on wall clock beyond a generous select timeout for scheduling.
+	select {
+	case <-cancelCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel was not invoked after stall dump")
+	}
+	if d.cancelCalls.Load() != 1 {
+		t.Fatalf("cancelCalls = %d, want 1", d.cancelCalls.Load())
+	}
+	if d.killCalls.Load() != 0 {
+		t.Fatalf("killCalls = %d before grace, want 0", d.killCalls.Load())
+	}
+
+	// Still within grace window — no kill.
+	clock.now = clock.now.Add(tuiWatchdogCancelGrace - 100*time.Millisecond)
+	d.onTick(clock.now)
+	if d.killCalls.Load() != 0 {
+		t.Fatalf("killCalls during grace = %d, want 0", d.killCalls.Load())
+	}
+
+	// Grace expires, still no heartbeat → hard-kill once.
+	clock.now = clock.now.Add(200 * time.Millisecond)
+	d.onTick(clock.now)
+	if d.killCalls.Load() != 1 {
+		t.Fatalf("killCalls after grace = %d, want 1", d.killCalls.Load())
+	}
+	// Repeat tick does not re-kill.
+	clock.now = clock.now.Add(time.Second)
+	d.onTick(clock.now)
+	if d.killCalls.Load() != 1 || d.cancelCalls.Load() != 1 {
+		t.Fatalf("duplicate escalation: cancel=%d kill=%d", d.cancelCalls.Load(), d.killCalls.Load())
+	}
+}
+
+func TestWatchdogGraceHeartbeatAbortsKill(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	d.NoteRunning(func() {})
+
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now)
+	if d.dumpCalls.Load() != 1 {
+		t.Fatalf("dumpCalls = %d, want 1", d.dumpCalls.Load())
+	}
+
+	// Heartbeat during grace aborts hard-kill.
+	clock.now = clock.now.Add(time.Second)
+	d.NoteActiveHeartbeat("elapsed_tick")
+	clock.now = clock.now.Add(tuiWatchdogCancelGrace)
+	d.onTick(clock.now)
+	if d.killCalls.Load() != 0 {
+		t.Fatalf("killCalls after heartbeat = %d, want 0", d.killCalls.Load())
+	}
+}
+
+// TestWatchdogCancelOncePerGeneration pins "one Cancel per Turn": after a grace
+// abort via heartbeat, a later stall on the same generation may dump/kill but
+// must not invoke Cancel() again.
+func TestWatchdogCancelOncePerGeneration(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	// cancelCalls is incremented before the hook body, so assertions below do not
+	// need to wait for a separate scheduler turn.
+	d.NoteRunning(func() {})
+
+	// First stall → cancel once.
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now)
+	if d.cancelCalls.Load() != 1 {
+		t.Fatalf("first cancelCalls = %d, want 1", d.cancelCalls.Load())
+	}
+	// Heartbeat aborts grace (cancelIssued stays sticky).
+	clock.now = clock.now.Add(time.Second)
+	d.NoteActiveHeartbeat("elapsed_tick")
+	// Second stall on the same generation.
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now)
+	if d.cancelCalls.Load() != 1 {
+		t.Fatalf("second stall re-canceled: cancelCalls=%d, want 1", d.cancelCalls.Load())
+	}
+	if d.dumpCalls.Load() != 2 {
+		t.Fatalf("second stall dumpCalls = %d, want 2 (re-dump allowed)", d.dumpCalls.Load())
+	}
+	// Grace after second escalation still hard-kills once.
+	clock.now = clock.now.Add(tuiWatchdogCancelGrace)
+	d.onTick(clock.now)
+	if d.killCalls.Load() != 1 {
+		t.Fatalf("killCalls after second grace = %d, want 1", d.killCalls.Load())
+	}
+}
+
+func TestWatchdogStaleCancelCannotAffectNewGeneration(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	var oldCancelCalls atomic.Int32
+	d.NoteRunning(func() { oldCancelCalls.Add(1) })
+	oldGeneration := d.generationForTest()
+	d.NoteIdle()
+	d.NoteRunning(func() {})
+
+	d.cancelCurrentGeneration(oldGeneration, func() { oldCancelCalls.Add(1) })
+	if got := oldCancelCalls.Load(); got != 0 {
+		t.Fatalf("stale cancellation invoked old callback %d times, want 0", got)
+	}
+}
+
+func TestWatchdogTurnDoneDuringGraceAbortsKill(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	d.NoteRunning(func() {})
+
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now)
+	// TurnDone → idle before grace expires.
+	d.NoteIdle()
+	if d.phaseForTest() != watchdogIdle {
+		t.Fatalf("phase = %s, want idle", d.phaseForTest())
+	}
+	clock.now = clock.now.Add(tuiWatchdogCancelGrace + time.Second)
+	d.onTick(clock.now)
+	if d.killCalls.Load() != 0 {
+		t.Fatalf("kill after TurnDone = %d, want 0", d.killCalls.Load())
+	}
+}
+
+func TestWatchdogClosedStopsAllActions(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	d.NoteRunning(func() {})
+	d.Close()
+	if d.phaseForTest() != watchdogClosed {
+		t.Fatalf("phase = %s, want closed", d.phaseForTest())
+	}
+	clock.now = clock.now.Add(tuiWatchdogStall + time.Second)
+	d.onTick(clock.now)
+	if d.dumpCalls.Load() != 0 || d.cancelCalls.Load() != 0 || d.killCalls.Load() != 0 {
+		t.Fatalf("closed watchdog still acted: dump=%d cancel=%d kill=%d",
+			d.dumpCalls.Load(), d.cancelCalls.Load(), d.killCalls.Load())
+	}
+}
+
+func TestWatchdogStaleGenerationCannotKillNewTurn(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	d.NoteRunning(func() {}) // gen 1
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now) // escalate gen 1
+	if d.cancelCalls.Load() != 1 {
+		t.Fatalf("cancelCalls = %d, want 1", d.cancelCalls.Load())
+	}
+
+	// New turn starts (generation bumps); old grace must not kill it.
+	d.NoteIdle()
+	d.NoteRunning(func() {}) // gen 2
+	clock.now = clock.now.Add(tuiWatchdogCancelGrace + time.Second)
+	// Heartbeat keeps gen 2 healthy.
+	d.NoteActiveHeartbeat("elapsed_tick")
+	d.onTick(clock.now)
+	if d.killCalls.Load() != 0 {
+		t.Fatalf("stale kill hit new generation: killCalls=%d", d.killCalls.Load())
+	}
+	if d.generationForTest() != 2 {
+		t.Fatalf("generation = %d, want 2", d.generationForTest())
+	}
+}
+
+func TestWatchdogUserActivityDoesNotCountAsActiveHeartbeat(t *testing.T) {
+	// NoteBooted / NoteIdle paths are the only non-active transitions; keyboard
+	// never calls NoteActiveHeartbeat. Prove that without it, a running stall
+	// still escalates even if "time passes" via booted-style idle marks.
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	d.NoteRunning(func() {})
+	// Simulate only user-facing updates that do not call NoteActiveHeartbeat.
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now)
+	if d.dumpCalls.Load() != 1 {
+		t.Fatalf("stall without active heartbeat dumpCalls = %d, want 1", d.dumpCalls.Load())
+	}
+}
+
+func TestChatTUIWatchdogHelpersAreNilSafe(t *testing.T) {
+	var m chatTUI
+	m.noteWatchdogRunning()
+	m.noteWatchdogIdle()
+	m.noteWatchdogHeartbeat("elapsed_tick")
+}
+
+func TestChatTUIWatchdogLifecycleHelpers(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	m := chatTUI{diagnostics: d}
+
+	// Boot confirmation (first Update path).
+	m.diagnostics.NoteBooted()
+	if d.phaseForTest() != watchdogIdle {
+		t.Fatalf("after NoteBooted phase = %s, want idle", d.phaseForTest())
+	}
+
+	// Shell / controller turn entry.
+	m.noteWatchdogRunning()
+	if d.phaseForTest() != watchdogRunning {
+		t.Fatalf("phase = %s, want running", d.phaseForTest())
+	}
+	m.noteWatchdogHeartbeat("elapsed_tick")
+	// TurnDone / shell completion.
+	m.noteWatchdogIdle()
+	if d.phaseForTest() != watchdogIdle {
+		t.Fatalf("phase after idle = %s, want idle", d.phaseForTest())
+	}
+}
+
+// TestWatchdogTickGapSkipsSuspendedProcess verifies the tick-gap heuristic that
+// tells a real OS suspension (Android backgrounding, screen off) from a healthy
+// 1s ticker: the watchdog's own ticker stalls for far longer than its interval
+// while the process is frozen, so the heartbeat age read at resume is inflated
+// by the pause and must not be read as a wedged event loop.
 func TestWatchdogTickGapSkipsSuspendedProcess(t *testing.T) {
 	now := time.Now()
 	// A normal 1s ticker gap is never a suspension.
@@ -222,52 +519,67 @@ func TestWatchdogTickGapSkipsSuspendedProcess(t *testing.T) {
 	}
 }
 
-// TestWatchdogKillStillFiresWithoutSuspension guards the opposite direction:
-// a genuinely wedged event loop (process alive, ticker healthy, no progress)
-// must still be killed after tuiWatchdogStall — the suspend detection must not
-// swallow real stalls.
-func TestWatchdogKillStillFiresWithoutSuspension(t *testing.T) {
-	d := startTUIDiagnostics(t.TempDir())
-	t.Cleanup(d.Close)
-	// Simulate the decision path: fresh ticker (no suspension), progress age
-	// beyond the stall threshold -> the watchdog must decide to kill.
-	lastTick := time.Now()
-	now := lastTick.Add(tuiWatchdogInterval)
-	if watchdogTickGap(lastTick, now) {
-		t.Fatal("healthy ticker must not look suspended")
+// TestWatchdogSuspendDoesNotKill is the regression test for the stall watchdog
+// killing a healthy TUI after an OS suspension (Android lock/screen-off): the
+// process freezes, the watchdog ticker goes silent, and the heartbeat age
+// measured at resume is inflated by the whole pause. noteSuspended must reset
+// the heartbeat to the resume moment so a healthy-but-asleep TUI is not killed.
+func TestWatchdogSuspendDoesNotKill(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	d.NoteRunning(func() {})
+
+	// Device sleeps for 5 minutes: no ticks, no heartbeats.
+	clock.now = clock.now.Add(5 * time.Minute)
+	// Resume: the first tick sees the huge gap and refreshes liveness.
+	d.noteSuspended(clock.now, 5*time.Minute)
+
+	// One healthy second after resume must not escalate.
+	clock.now = clock.now.Add(time.Second)
+	d.onTick(clock.now)
+	if got := d.dumpCalls.Load(); got != 0 {
+		t.Fatalf("after suspend refresh dumpCalls = %d, want 0", got)
 	}
-	// Age the last progress past the stall threshold as a wedged loop would.
-	d.lastProgress.Store(time.Since(monoAnchor).Nanoseconds() - (tuiWatchdogStall + time.Second).Nanoseconds())
-	if age := time.Duration(time.Since(monoAnchor).Nanoseconds() - d.lastProgress.Load()); age < tuiWatchdogStall {
-		t.Fatalf("test setup: progress age %s not beyond stall %s; cannot exercise the kill branch", age, tuiWatchdogStall)
+	if got := d.cancelCalls.Load(); got != 0 {
+		t.Fatalf("after suspend refresh cancelCalls = %d, want 0", got)
+	}
+	if got := d.killCalls.Load(); got != 0 {
+		t.Fatalf("after suspend refresh killCalls = %d, want 0", got)
 	}
 }
 
-// TestWatchdogSuspendDoesNotKill is the regression test for the stall watchdog
-// killing a healthy TUI after Android system suspend (lock/screen-off): while
-// the device sleeps, CLOCK_MONOTONIC pauses and CLOCK_REALTIME keeps running,
-// so a wall-clock progress age is inflated by the whole sleep and reads as a
-// wedged event loop. The age must be measured on the monotonic clock — a big
-// wall gap with a small monotonic gap (suspend resumed) must stay far below
-// the stall threshold.
-func TestWatchdogSuspendDoesNotKill(t *testing.T) {
-	d := startTUIDiagnostics(t.TempDir())
-	t.Cleanup(d.Close)
+// TestWatchdogSuspendRefreshDoesNotSwallowRealStall guards the opposite
+// direction: refreshing the heartbeat on resume must not mask a genuinely
+// wedged event loop afterwards. A real stall after the refresh still escalates
+// through dump, cancel, grace, and hard-kill.
+func TestWatchdogSuspendRefreshDoesNotSwallowRealStall(t *testing.T) {
+	clock := &fakeWatchClock{now: time.Unix(1_700_000_000, 0)}
+	d := newWatchdogForTest(t, clock)
+	d.NoteBooted()
+	d.NoteRunning(func() {})
 
-	// A 5-minute wall gap (the suspend) that the monotonic clock did not
-	// count, plus a small monotonic age since the last progress.
-	wallElapsed := 5 * time.Minute
-	monoAge := 2 * time.Second
-	d.lastProgress.Store(time.Since(monoAnchor).Nanoseconds() - monoAge.Nanoseconds())
+	// Resume from a suspension refreshes the reference point.
+	d.noteSuspended(clock.now, 5*time.Minute)
 
-	if wallAge := time.Since(time.Now().Add(-wallElapsed)); wallAge < tuiWatchdogStall {
-		t.Fatalf("test setup: wall age %s not beyond stall %s; cannot contrast the two clocks", wallAge, tuiWatchdogStall)
+	// The event loop then genuinely wedges: stall threshold passes with no
+	// heartbeat, exactly as a frozen loop would.
+	clock.now = clock.now.Add(tuiWatchdogStall)
+	d.onTick(clock.now)
+	if got := d.dumpCalls.Load(); got != 1 {
+		t.Fatalf("stall after suspend dumpCalls = %d, want 1", got)
 	}
-	age := time.Duration(time.Since(monoAnchor).Nanoseconds() - d.lastProgress.Load())
-	if age >= tuiWatchdogStall {
-		t.Fatalf("monotonic age %s >= stall %s; suspend would be misread as a wedged event loop and the TUI killed", age, tuiWatchdogStall)
+	if got := d.cancelCalls.Load(); got != 1 {
+		t.Fatalf("stall after suspend cancelCalls = %d, want 1", got)
 	}
-	if age > monoAge+time.Second {
-		t.Fatalf("monotonic age %s unexpectedly larger than the seeded age %s", age, monoAge)
+	if got := d.killCalls.Load(); got != 0 {
+		t.Fatalf("killCalls before grace expiry = %d, want 0", got)
+	}
+
+	// Grace expires with no recovery: hard-kill fires.
+	clock.now = clock.now.Add(tuiWatchdogCancelGrace + time.Second)
+	d.onTick(clock.now)
+	if got := d.killCalls.Load(); got != 1 {
+		t.Fatalf("killCalls after grace expiry = %d, want 1", got)
 	}
 }

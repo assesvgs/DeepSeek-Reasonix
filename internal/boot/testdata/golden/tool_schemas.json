@@ -148,7 +148,7 @@
   },
   {
     "Name": "complete_step",
-    "Description": "Record the evidence-backed completion of ONE step of an approved plan. Call it as you finish each step instead of silently moving on: it signs the step off with PROOF it is done — the verification you ran (command + result), a completed built-in review that is fresh for any later changes, the diff/files you changed, or a manual check. A completion with no evidence is REJECTED, so don't claim a step is done until you can show why. The host advances the task list for you when you sign off — it marks this step completed and moves the next to in_progress, so you don't need a separate todo_write to mark completions. Fields: `step` (which step — its title or number, matching the task list), `result` (what is now true/changed), `evidence` (≥1 item, each with `kind` = verification|review|diff|files|manual and a `summary`, plus optional `command`/`paths`), and optional `notes`.",
+    "Description": "Record the evidence-backed completion of ONE step of an approved plan. Call it as you finish each step instead of silently moving on: it signs the step off with PROOF it is done — the verification you ran (command + result), a completed built-in review that is fresh for any later changes, the diff/files you changed, or a manual check. A completion with no evidence is REJECTED, so don't claim a step is done until you can show why. The host advances the task list for you when you sign off — it marks this step completed and moves the next to in_progress, so you don't need a separate todo_write to mark completions. Fields: `step` (which step — its title or number, matching the task list), `result` (what is now true/changed), `evidence` (≥1 item, each with `kind` = verification|review|diff|files|manual and a `summary`, plus optional `command`/`paths`, and `criterion_id` naming the acceptance criterion the proof satisfies), and optional `notes`.",
     "ReadOnly": true,
     "Schema": {
       "properties": {
@@ -158,6 +158,10 @@
             "properties": {
               "command": {
                 "description": "REQUIRED for verification evidence: the command as it actually ran (e.g. \"go test ./...\") — it is checked against this session's real command history.",
+                "type": "string"
+              },
+              "criterion_id": {
+                "description": "The acceptance criterion this proof satisfies, as the plan renders it (e.g. \"c2\" from \"accept [c2]: ...\"). Cite it whenever the step has criteria: a command succeeding is not the same as a criterion being met, and the host records the proof against the criterion you name.",
                 "type": "string"
               },
               "kind": {
@@ -201,11 +205,15 @@
           "type": "string"
         },
         "step": {
-          "description": "Which plan step this completes — its title or number, matching the task list.",
+          "description": "Which plan step this completes — its title or number, matching the task list. Use only when the item has no step_id.",
+          "type": "string"
+        },
+        "step_id": {
+          "description": "PREFERRED: the stable step_id of the task-list item this completes, e.g. \"plan_step_02\". Unlike a title or a number it survives retitles, insertions, and reordering, so cite it whenever the item has one.",
           "type": "string"
         },
         "step_index": {
-          "description": "Optional 1-based task-list item number. Prefer this when the step title is long or easy to mistype.",
+          "description": "Optional 1-based task-list item number. Use only when the item has no step_id; an index goes stale the moment a step is inserted above it.",
           "minimum": 1,
           "type": "integer"
         }
@@ -213,6 +221,40 @@
       "required": [
         "evidence",
         "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "Name": "compress",
+    "Description": "Compress a selected part of the current model-visible conversation without deleting visible history. Use only when the user explicitly asks for context compression. Choose `before` to summarize everything before the uniquely matched user turn while keeping that turn and later context, or `after` to summarize from that turn through the last completed turn while keeping the active turn. The anchor must be an exact, unique excerpt from a real user message; use a longer excerpt if the tool reports multiple matches.",
+    "ReadOnly": true,
+    "Schema": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "description": "An exact, unique excerpt from one real user message in the current model-visible conversation.",
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "direction": {
+          "description": "Which side of the anchor user turn to compress.",
+          "enum": [
+            "before",
+            "after"
+          ],
+          "type": "string"
+        },
+        "focus": {
+          "description": "Optional guidance about facts or decisions the summary must preserve.",
+          "maxLength": 2000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "anchor",
+        "direction"
       ],
       "type": "object"
     }
@@ -368,7 +410,7 @@
   },
   {
     "Name": "explore",
-    "Description": "Run a focused read-only codebase investigation in an isolated subagent. Use for broad survey questions across many files — 'find all places that X', 'how does Y work across the project', 'audit Z'. Returns one distilled answer with file:line citations. Its reads + reasoning never enter your context, unlike chained read_file.",
+    "Description": "在隔离子代理中做一次聚焦的只读代码库调查。用于跨多文件的宽泛调研——'找出所有使用 X 的地方'、'Y 在项目中如何工作'、'审计 Z'。返回一份带 file:line 引用的提炼结论。与链式 read_file 不同，其阅读与推理不会进入你的上下文。",
     "ReadOnly": false,
     "Schema": {
       "properties": {
@@ -389,10 +431,14 @@
   },
   {
     "Name": "fleet",
-    "Description": "Dispatch 2–64 sub-agent tasks in parallel and return bounded previews plus stable Subagent references for full-result retrieval from completed persisted children with read_subagent_result. Each item may select a profile, model, effort, tools, write_paths, or read_only. Multiple writers must declare non-overlapping write_paths; omitted write_paths claim the whole workspace, so two or more writers without paths fail preflight before any task starts. Independent failure is the default: one failure does not cancel others. Background mode returns a fleet job id collectable with wait.",
+    "Description": "Dispatch 2–64 sub-agent tasks as a small dependency graph and return bounded previews plus stable Subagent references for full-result retrieval from completed persisted children with read_subagent_result. Each item may select a profile, model, effort, tools, write_paths, or read_only, and may declare depends_on to run after other items (research → implement → review). Tasks with no dependency between them run in parallel and must declare non-overlapping write_paths; ordered tasks may share paths. Omitted write_paths claim the whole workspace, so two or more concurrent writers without paths fail preflight before any task starts. A failed task's dependents are skipped; independent branches keep going unless fail_fast is set. Background mode returns a fleet job id collectable with wait.",
     "ReadOnly": false,
     "Schema": {
       "properties": {
+        "fail_fast": {
+          "description": "Stop starting new tasks after the first failure. Tasks already running are left to finish so partial writes are not abandoned mid-flight. Omitted (the default) means independent branches keep going; a failed task's dependents are skipped either way.",
+          "type": "boolean"
+        },
         "run_in_background": {
           "description": "Run the whole fleet asynchronously and return a job id collectable with wait. Items queue for concurrency/write slots inside the job.",
           "type": "boolean"
@@ -401,12 +447,23 @@
           "description": "Array of 2–64 sub-tasks to run under the session scheduler.",
           "items": {
             "properties": {
+              "depends_on": {
+                "description": "Ids of tasks that must complete before this one starts. Unknown ids, self-edges, and cycles fail preflight. A task whose dependency fails or is skipped is skipped too. Ordered tasks may share write_paths; only tasks that can run at the same time need disjoint claims.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
               "description": {
                 "description": "Optional short label shown in the job list.",
                 "type": "string"
               },
               "effort": {
                 "description": "Optional reasoning effort override.",
+                "type": "string"
+              },
+              "id": {
+                "description": "Optional stable id for this task, referenced by other tasks' depends_on. Defaults to the 1-based position.",
                 "type": "string"
               },
               "max_steps": {
@@ -438,7 +495,7 @@
                 "type": "array"
               },
               "write_paths": {
-                "description": "Write targets for this item. Parallel writers must declare non-overlapping paths. Omitting write_paths claims the whole workspace; multiple whole-workspace claims (or any path overlap) fail preflight and start nothing.",
+                "description": "Write targets for this item. Writers that can run at the same time must declare non-overlapping paths; writers ordered by depends_on may share them. Omitting write_paths claims the whole workspace; two concurrent whole-workspace claims (or any overlap between concurrent writers) fail preflight and start nothing.",
                 "items": {
                   "type": "string"
                 },
@@ -1297,6 +1354,14 @@
     "ReadOnly": false,
     "Schema": {
       "properties": {
+        "activation": {
+          "description": "How the fact reaches the model: relevant (the default) is retrieval-only; pinned loads the body into every session's stable prefix. Use pinned ONLY when the user explicitly asks for an always-available fact — pinned space is budget-limited, and rules that must always hold belong in REASONIX.md/AGENTS.md instructions instead. Omit on update to preserve the current choice.",
+          "enum": [
+            "relevant",
+            "pinned"
+          ],
+          "type": "string"
+        },
         "body": {
           "description": "The fact itself (Markdown). For feedback/project, include a \"**Why:**\" line and a \"**How to apply:**\" line; link related memories with [[their-name]].",
           "type": "string"
@@ -1310,8 +1375,16 @@
           "minimum": 1,
           "type": "integer"
         },
+        "expires_at": {
+          "description": "Hard expiry as RFC3339 or YYYY-MM-DD. Past this moment the fact stops being auto-recalled entirely. Set it when the fact has a known end of life. Omit on update to preserve; \"never\" clears an existing expiry.",
+          "type": "string"
+        },
         "id": {
           "description": "Stable memory id for an update. Prefer this over name when supplied by memory search/read.",
+          "type": "string"
+        },
+        "keywords": {
+          "description": "Space-separated search aliases a future query might use where the body's own words would miss: synonyms, translations of key terms (recall matching is lexical, so give Chinese facts English aliases and vice versa), related command or tool names. Omit when the body already carries the likely query words. When updating, omit to preserve existing keywords.",
           "type": "string"
         },
         "name": {
@@ -1324,6 +1397,10 @@
             "project",
             "global"
           ],
+          "type": "string"
+        },
+        "subject_key": {
+          "description": "Dotted key naming the question this fact answers, e.g. project.package_manager, project.release_branch, user.response_style. One active value per scope+subject: saving a new fact for a held subject is rejected with the holder's id — update that id so the change becomes a revision, not a contradiction. Search existing memories first and reuse their keys; omit for narrative facts that are not a single-valued answer.",
           "type": "string"
         },
         "title": {
@@ -1339,6 +1416,19 @@
             "reference"
           ],
           "type": "string"
+        },
+        "verified": {
+          "description": "Set true only when you have JUST re-confirmed the fact still holds (checked the file, ran the command). Renews the freshness clock without changing the meaning of updated_at.",
+          "type": "boolean"
+        },
+        "volatility": {
+          "description": "How fast the fact ages, independent of type: volatile for facts that die in days (a current release branch, this week's task), stable for slow-changing ones, evergreen for facts that never age (a README location, a fixed preference). Omit to use the type default, or on update to preserve the current choice.",
+          "enum": [
+            "evergreen",
+            "stable",
+            "volatile"
+          ],
+          "type": "string"
         }
       },
       "required": [
@@ -1350,7 +1440,7 @@
   },
   {
     "Name": "research",
-    "Description": "Combine web_fetch + code reading in an isolated subagent. Use when the answer needs both an external reference and local verification — 'is X supported by lib Y', 'compare our impl against the spec'. Returns one synthesis citing code (file:line) and web (URL).",
+    "Description": "在隔离子代理中结合 web_fetch 与代码阅读。用于答案既需要外部资料又需要本地验证时——'lib Y 是否支持 X'、'将我们的实现与规范对比'。返回一份同时引用代码（file:line）与网页（URL）的综合结论。",
     "ReadOnly": false,
     "Schema": {
       "properties": {
@@ -1371,7 +1461,7 @@
   },
   {
     "Name": "review",
-    "Description": "Review the pending changes (current branch diff) in an isolated subagent — flags correctness / security / missing-tests / hidden behavior per file:line. Read-only; you decide what to act on. Use before suggesting a PR-shaped change or after finishing a multi-step edit.",
+    "Description": "在隔离子代理中审查待提交改动（当前分支 diff）——按 file:line 标记正确性/安全/缺失测试/隐藏行为。只读；由你决定如何处理。适合在提出 PR 形改动前或完成多步编辑后使用。",
     "ReadOnly": false,
     "Schema": {
       "properties": {
@@ -1417,7 +1507,7 @@
   },
   {
     "Name": "security_review",
-    "Description": "Security-focused review of the current branch diff in an isolated subagent — injection / authz / secrets / deserialization / path-traversal / crypto, severity-tagged. Read-only. Use when shipping changes that touch auth, input parsing, file IO, or external requests.",
+    "Description": "在隔离子代理中做安全重点审查（当前分支 diff）——注入/鉴权/密钥/反序列化/路径穿越/加密，按严重程度分级。只读。适用于涉及认证、输入解析、文件 IO 或外部请求的改动上线前。",
     "ReadOnly": false,
     "Schema": {
       "properties": {
@@ -1516,7 +1606,7 @@
   },
   {
     "Name": "todo_write",
-    "Description": "Record and update a structured task list for the current work. Send the COMPLETE list every call — it replaces the previous one. Use it to plan multi-step work and show progress: keep exactly one item in_progress at a time, and flip an item to completed the moment it's done (don't batch completions). Skip it for trivial single-step tasks. The list is two-level: a `level` 0 item is a PHASE (a milestone) and the `level` 1 items after it are its concrete sub-steps; omit `level` (0) for a flat list. Each item has `content` (imperative, e.g. \"Add the parser\"), `status` (pending|in_progress|completed), `activeForm` (present-continuous shown while in progress, e.g. \"Adding the parser\"), and optional `level` (0 phase | 1 sub-step).",
+    "Description": "Record and update a structured task list for the current work. Send the COMPLETE list every call — it replaces the previous one. Use it to plan multi-step work and show progress: keep exactly one item in_progress at a time, and flip an item to completed the moment it's done (don't batch completions). Skip it for trivial single-step tasks. The list is two-level: a `level` 0 item is a PHASE (a milestone) and the `level` 1 items after it are its concrete sub-steps; omit `level` (0) for a flat list. Each item has `content` (imperative, e.g. \"Add the parser\"), `status` (pending|in_progress|completed), `activeForm` (present-continuous shown while in progress, e.g. \"Adding the parser\"), optional `level` (0 phase | 1 sub-step), and `step_id` — an item's stable identity. COPY `step_id` VERBATIM for every item that already has one: it is how a completion stays attached to its step when you retitle it, insert a step above it, or reorder the list. Give a new item a fresh unique id (e.g. \"plan_step_07\"); never reuse or renumber an existing one.",
     "ReadOnly": true,
     "Schema": {
       "properties": {
@@ -1548,6 +1638,10 @@
                   "completed"
                 ],
                 "type": "string"
+              },
+              "step_id": {
+                "description": "Stable identity for this item, e.g. \"plan_step_02\". Copy it verbatim from the item's previous entry so completions stay attached across retitles, insertions, and reordering; use a fresh unique id for a genuinely new item.",
+                "type": "string"
               }
             },
             "required": [
@@ -1567,10 +1661,37 @@
   },
   {
     "Name": "update_goal",
-    "Description": "Report this turn's disposition for the active goal. Call it at the end of every goal turn instead of using prose markers: `continue` (work is ongoing — give a concrete next_action), `complete` (the request is fully done, output format and constraints satisfied, and verification was attempted or reported unavailable), or `blocked` (only the user can unblock: missing user-only information, an irreversible/externally visible operation, or changed scope). The host validates your claim against Delivery acceptance criteria and decides whether to continue automatically. Fields: `status` (required, one of continue|complete|blocked), `reason` (required for continue and blocked, optional for complete), `next_action` (optional concrete next step; recommended for continue).",
+    "Description": "Report this turn's disposition for the active goal. Call it at the end of every goal turn instead of using prose markers: `continue` (work is ongoing — give a concrete next_action), `complete` (the request is fully done, output format and constraints satisfied, and verification was attempted or reported unavailable), or `blocked` (only the user can unblock: missing user-only information, an irreversible/externally visible operation, or changed scope). The host validates your claim against Delivery acceptance criteria and decides whether to continue automatically. Fields: `status` (required, one of continue|complete|blocked), `reason` (required for continue and blocked, optional for complete), `next_action` (optional concrete next step; recommended for continue), `completion` (recommended with complete: `verified` is checked against real receipts, while `unverified` and `risks` are yours to declare and never count against you).",
     "ReadOnly": true,
     "Schema": {
       "properties": {
+        "completion": {
+          "description": "Your own account of the finished work.",
+          "properties": {
+            "risks": {
+              "description": "Known risks to carry forward.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "unverified": {
+              "description": "What you did NOT verify. The host cannot infer what you skipped, so stating it is the only way it is known — and it never blocks completion.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "verified": {
+              "description": "Commands you ran as proof, as they actually ran. One that never ran, failed, or predates your latest change is recorded as an unbacked claim.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
         "next_action": {
           "description": "Optional concrete next step. Recommended for continue so the host can guide the next turn.",
           "type": "string"

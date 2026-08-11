@@ -15,6 +15,12 @@
 # Usage: scripts/desktop-build.sh <os/arch> <version> [channel]
 #   e.g. scripts/desktop-build.sh darwin/arm64 v1.1.0
 #        scripts/desktop-build.sh darwin/arm64 v1.5.0-preview.42 preview
+#
+# Requirements:
+#   - Go toolchain matching desktop/go.mod (>= 1.25; the `toolchain` directive
+#     auto-downloads when GOTOOLCHAIN=auto)
+#   - Node >= 24 and pnpm 10 (the same major versions used by CI and releases)
+#   - Wails CLI matching the shared .wails-version pin (`make wails-install`)
 set -euo pipefail
 
 PLATFORM="${1:?usage: desktop-build.sh <os/arch> <version> [channel]}"
@@ -32,6 +38,7 @@ WINDOWS_CLINAME="reasonix-cli" # Windows cannot store Reasonix.exe and reasonix.
 GUARDNAME="reasonix-guard"
 LAUNCHERNAME="reasonix-launcher"
 windows_resource_tool_dir=""
+windows_host_include=""
 
 # desktop/ is a nested Go module, so the Go toolchain cannot discover the
 # repository VCS revision for the Wails binary. Link the same source identity
@@ -51,6 +58,9 @@ cli_identity_ldflags="-X main.version=$VERSION -X main.gitCommit=$GIT_COMMIT -X 
 cleanup() {
 	if [ -n "$windows_resource_tool_dir" ]; then
 		rm -rf "$windows_resource_tool_dir"
+	fi
+	if [ -n "$windows_host_include" ]; then
+		rm -f "$windows_host_include"
 	fi
 }
 trap cleanup EXIT
@@ -116,6 +126,15 @@ ldflags="-X main.version=$VERSION -X main.channel=$CHANNEL $product_docs_ldflags
 UPDATE_HELPER="reasonix-update-helper.exe"
 if [ "$os" = windows ]; then
 	windows_resource_tool_dir=$(mktemp -d)
+	windows_host_include="$ROOT/desktop/build/windows/installer/reasonix_host.nsh"
+	case "$(uname -s 2>/dev/null || printf '%s' unknown)" in
+		Darwin* | Linux* | FreeBSD*)
+			printf '%s\n' '!define REASONIX_UNINST_FINALIZE '\''/bin/cp -f "%1" "reasonix-uninstall.exe"'\''' >"$windows_host_include"
+			;;
+		*)
+			printf '%s\n' '!define REASONIX_UNINST_FINALIZE '\''cmd.exe /C copy /Y "%1" "reasonix-uninstall.exe" >NUL'\''' >"$windows_host_include"
+			;;
+	esac
 	windows_resource_tool="$windows_resource_tool_dir/reasonix-windows-resource.exe"
 	echo "==> build Windows resource stamper"
 	go build -trimpath -o "$windows_resource_tool" ./cmd/windows-resource

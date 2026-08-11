@@ -2,6 +2,8 @@
 // One event channel carries every kind; `kind` discriminates the payload.
 
 import type { Todo } from "./tools";
+import type { ContextMaintenanceInfo, WireContextMaintenance } from "./contextMaintenanceTypes";
+export type { ContextMaintenanceInfo, ContextMaintenanceReceipt, WireContextMaintenance } from "./contextMaintenanceTypes";
 
 export type EventKind =
   | "turn_started"
@@ -25,7 +27,9 @@ export type EventKind =
   | "guardian_assessment"
   | "extension_surface"
   | "extension_status"
-  | "stream_attempt";
+  | "stream_attempt"
+  | "context_maintenance"
+  | "workspace_changed";
 
 export type StreamAttemptAction = "begin" | "discard" | "commit";
 
@@ -292,10 +296,13 @@ export interface WireEvent {
   approval?: WireApproval;
   ask?: WireAsk;
   compaction?: WireCompaction;
+  maintenance?: WireContextMaintenance;
   guardian?: WireGuardian;
   decisionReceipt?: WireDecisionReceipt;
   extension?: WireExtensionSurface;
   err?: string;
+  checkpointTurn?: number; // Authoritative TurnDone rewind target; zero is valid.
+  submissionId?: string; // Opaque correlation for the exact optimistic user submission.
   outcome?: "final_readiness" | "recovery_paused";
   readiness?: WireFinalReadiness;
   retryAttempt?: number;
@@ -303,9 +310,10 @@ export interface WireEvent {
   /** Optional: "headers" | "stream". Older clients ignore unknown fields. */
   retryScope?: "headers" | "stream";
   streamAttempt?: WireStreamAttempt;
-  // Tab routing: set by the Go-side tabEventSink so multi-tab frontends
-  // route each event to the correct per-tab reducer.
-  tabId?: string;
+  /** Durable session-inbox item id for steer / TurnDone correlation. */
+  itemId?: string;
+  workspace?: WireWorkspaceChanged;
+  tabId?: string; // Go's tabEventSink tags events for the correct per-tab reducer.
   runtimeEpoch?: string;
   sessionHitTokens?: number;
   sessionMissTokens?: number;
@@ -313,6 +321,31 @@ export interface WireEvent {
   sessionCurrency?: string;
   // Deprecated compatibility alias. Prefer sessionCost + sessionCurrency.
   sessionCostUsd?: number;
+}
+
+export type WorkspaceWatchState = "active" | "degraded" | "unavailable";
+export type WorkspaceChangeOp = "create" | "write" | "remove" | "rename" | "unknown";
+
+export interface WorkspaceRevisions {
+  content: number;
+  tree: number;
+  workingTree: number;
+  gitMeta: number;
+  session: number;
+}
+
+export interface WorkspacePathChange {
+  path: string;
+  oldPath?: string;
+  op: WorkspaceChangeOp;
+}
+
+export interface WireWorkspaceChanged {
+  revisions: WorkspaceRevisions;
+  changes: WorkspacePathChange[];
+  allPaths: boolean;
+  source: "agent" | "filesystem" | "git" | "mixed" | "reconcile";
+  watchState: WorkspaceWatchState;
 }
 
 export type SessionRuntimePhase = "starting" | "ready" | "lease_blocked" | "failed" | "closing";
@@ -350,6 +383,8 @@ export interface TabMeta {
   topicId: string;
   topicTitle: string;
   sessionPath?: string;
+  sessionRevision?: number;
+  sessionDigest?: string;
   readOnly?: boolean;
   filePath?: string;
   projectColor?: string;
@@ -367,7 +402,6 @@ export interface TabMeta {
   tokenMode?: TokenMode;
   goal?: string;
   goalStatus?: GoalStatus;
-  autoResearch?: AutoResearchCompactView;
   recovered?: boolean;
   recoveryReason?: string;
   recoveryDigest?: string;
@@ -572,6 +606,99 @@ export interface HistoryPage {
   endTurn: number;
   totalTurns: number;
   hasOlder: boolean;
+  revision?: number;
+  digest?: string;
+}
+
+// ── Windowed history paging (desktop/history_slice.go) ──────────────────────
+// HistorySliceForTab pages toward older history with an opaque cursor; the
+// first call uses cursor "" for the newest page. Entry IDs are stable for the
+// life of a session revision (s<file>:r<epoch>:m<msgIndex>:o<subOrder>).
+
+export interface HistorySliceRequest {
+  cursor: string; // "" = newest page; pass nextCursor to page older
+  turns?: number;
+  entries?: number;
+  bytes?: number;
+}
+
+// HistoryContentRef marks a string field replaced inline by a ≤4KiB preview;
+// the full value is fetchable in chunks via HistoryContentForTab.
+export interface HistoryContentRef {
+  entryId: string;
+  field: string; // content|reasoning|submitText|detail|code|summary|archive|toolResultError|toolArguments|toolSubject|toolSummary|toolDiff
+  size: number;
+  chunks: number;
+  toolCallId?: string;
+  revision: number;
+  revKnown?: boolean;
+  digest: string;
+}
+
+export interface HistoryEntry {
+  entryId: string;
+  turn: number; // 1-based visible turn (0 = before the first turn)
+  order: number; // absolute provider-message index
+  message: HistoryMessage;
+  refs: HistoryContentRef[];
+}
+
+export interface HistorySlice {
+  entries: HistoryEntry[];
+  nextCursor: string; // toward older; empty when none
+  hasOlder: boolean;
+  totalTurns: number;
+  startTurn: number;
+  endTurn: number;
+  stale: boolean; // cursor bound to an older session revision: discard + reload
+  revision: number;
+  revisionKnown?: boolean;
+  digest?: string;
+  // Diagnostic read path: index|scan|event-log|live-index|live-fallback (empty when the
+  // backend predates the field or no session was readable).
+  source?: string;
+}
+
+export interface HistoryContentChunk {
+  entryId: string;
+  field: string;
+  chunk: number;
+  chunks: number;
+  data: string;
+  done: boolean;
+  stale: boolean;
+}
+
+// ── Two-phase topic activation (desktop/topic_activation.go) ────────────────
+
+export interface TopicActivationRequest {
+  scope: string;
+  workspaceRoot: string;
+  topicId: string;
+  sessionPath: string;
+  requestId?: string;
+}
+
+export interface TopicActivationTicket {
+  requestId: string;
+  tabId: string;
+  meta: TabMeta;
+}
+
+export type TopicActivationPhase = "starting" | "ready" | "failed" | "cancelled";
+
+export interface TopicActivationEvent {
+  requestId: string;
+  tabId: string;
+  phase: TopicActivationPhase;
+  error?: string;
+}
+
+// tab:meta channel: a full refreshed Meta pushed after the background refresh
+// of the expensive MetaForTab fields (git branch, image-input capability).
+export interface TabMetaRefreshEvent {
+  tabId: string;
+  meta: Meta;
 }
 
 export interface PromptHistoryEntry {
@@ -695,6 +822,7 @@ export interface ContextInfo {
   cacheMissTokens?: number;
   estimated?: boolean;
   sources?: Record<string, UsageSourceStats>;
+  maintenance?: ContextMaintenanceInfo;
 }
 
 export interface Meta {
@@ -703,11 +831,13 @@ export interface Meta {
   runtime?: SessionRuntimeView;
   startupErr?: string;
   eventChannel: string;
+  sessionPath?: string;
+  sessionRevision?: number;
+  sessionDigest?: string;
   cwd: string;
   workspaceRoot?: string;
   workspaceName?: string;
   workspacePath?: string;
-  sessionPath?: string;
   gitBranch?: string;
   imageInputEnabled?: boolean;
   autoApproveTools?: boolean;
@@ -718,7 +848,6 @@ export interface Meta {
   goal?: string;
   goalStatus?: GoalStatus;
   goalRuntime?: GoalRuntime;
-  autoResearch?: AutoResearchCompactView;
   canonicalTodos?: Todo[];
 }
 
@@ -727,71 +856,22 @@ export type ToolApprovalMode = "ask" | "auto" | "yolo";
 // "full" is the persisted compatibility value for the Balanced runtime profile.
 export type TokenMode = "full" | "economy" | "delivery";
 export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
-
 // GoalRuntime is the optional Goal budget/runtime summary the backend attaches
 // to Meta. Absent for old hosts or when no goal is active.
 export interface GoalRuntime {
   turnsUsed: number;
   turnsLimit: number;
   tokensUsed: number;
+  requestsUsed?: number;
   /** @deprecated Goal has no hard token limit; retained as 0 for old hosts/clients. */
   tokensLimit: number;
   noProgressTurns: number;
+  /** @deprecated No longer enforced; retained for old hosts/clients. */
   noProgressLimit: number;
   lastReason?: string;
   stopCause?: string;
   budgetExtensions: number;
 }
-
-export interface AutoResearchCompactView {
-  taskId: string;
-  status: "running" | "blocked" | "complete" | "stopped" | "invalid";
-  iteration: number;
-  pivotRequired: boolean;
-  staleCount: number;
-}
-
-export interface AutoResearchCriterionView {
-  id: string;
-  description: string;
-  required: boolean;
-  evidenceCount: number;
-  status: string;
-}
-
-export interface AutoResearchStatusView extends AutoResearchCompactView {
-  goal: string;
-  currentDirection: string;
-  pivotCount: number;
-  lastHeartbeatAt: string;
-  findingCount: number;
-  openCriteria: AutoResearchCriterionView[];
-  blocker: string;
-  taskPath: string;
-  nextRequiredAction: string;
-}
-
-export interface AutoResearchFindingView {
-  id: string;
-  kind: string;
-  summary: string;
-  source: string;
-  command?: string;
-  paths?: string[];
-  accepted: boolean;
-  createdAt: string;
-}
-
-export interface AutoResearchEvidenceView {
-  id: string;
-  kind: string;
-  summary: string;
-  source: string;
-  command?: string;
-  paths?: string[];
-  accepted: boolean;
-}
-
 export function normalizeCollaborationMode(mode?: string, goal?: string, legacyMode?: Mode): CollaborationMode {
   if (mode === "plan" || mode === "goal" || mode === "normal") return mode;
   if (legacyMode && modeHasPlan(legacyMode)) return "plan";
@@ -988,6 +1068,7 @@ export interface SkillView {
   name: string;
   description: string;
   scope: string;
+  sourceDir?: string;
   runAs: string;
   enabled: boolean;
   plugin?: string;
@@ -1019,6 +1100,7 @@ export interface SkillRootView {
   scope: string;
   priority: number;
   status: string;
+  enabled: boolean;
   configured: boolean;
   removable: boolean;
   skills: number;
@@ -1030,10 +1112,12 @@ export interface CapabilitiesView {
   skills: SkillView[];
   skillRoots: SkillRootView[];
   plugins: PluginView[];
+  allowImplicitInvocation?: boolean;
 }
 export interface SkillsSettingsView {
   skills: SkillView[];
   skillRoots: SkillRootView[];
+  allowImplicitInvocation?: boolean;
 }
 export interface SubagentProfileInput {
   name: string;
@@ -1309,7 +1393,7 @@ export interface MemoryView {
 }
 
 // SettingsTab is the top-level navigation item in the Settings Centre modal.
-export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "remote" | "skills" | "subagents" | "plugins" | "memory" | "hooks" | "diagnostics" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
+export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "remote" | "skills" | "subagents" | "plugins" | "memory" | "hooks" | "diagnostics" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "storage" | "updates";
 
 // ── Remote SSH module (mirrors desktop/remote_app.go view structs) ──
 
@@ -1466,6 +1550,20 @@ export interface RemoteForwardsEvent {
   forwards: RemoteForwardView[];
 }
 
+/** Extension runtime doctor report from App.RuntimeDoctor. */
+export interface RuntimeDoctorReport {
+  text: string;
+  publishedGeneration: number;
+  allowResume: boolean;
+  cleanRollback: boolean;
+  hasIrreversible: boolean;
+  noOpRebuilds: number;
+  fullRebuilds: number;
+  subgraphRebuilds: number;
+  staleDrops: number;
+  admissionRejected: number; runtimeOwnerFallbacks: number;
+}
+
 /** Capability diagnostics report from App.CapabilityDiagnostics (capdiag.Report). */
 export interface CapabilityDiagnosticsReport {
   schema_version: number;
@@ -1576,6 +1674,7 @@ export interface ProviderView {
   models: string[];
   visionModels: string[]; // subset of models that accepts image input
   visionModelsConfigured: boolean; // true when an empty list is an explicit choice
+  visionCapability?: "configurable" | "unsupported"; // backend authority; absent on older Wails payloads
   modelsUrl: string; // optional override for model discovery; empty derives from baseUrl
   default: string;
   apiKeyEnv: string;
@@ -1589,12 +1688,14 @@ export interface ProviderView {
   keySourcePath?: string;
   balanceUrl: string; // optional wallet-balance endpoint; "" disables the readout
   contextWindow: number;
-  reasoningProtocol: string; // auto|deepseek|glm|openai|none; empty = auto/model registry
+  reasoningProtocol: string; // auto|deepseek|glm|kimi-k3|openai|none; empty = auto/model registry
   thinking: string; // provider-specific thinking override: ""|enabled|disabled|adaptive
   webSearch?: boolean; // expose a provider-executed web search tool when supported
+  serverWebSearchCapability?: boolean; // backend-verified provider capability; absent on older Wails payloads
   supportedEfforts: string[]; // custom /effort levels; empty = use built-in Kind/BaseURL default
   defaultEffort: string; // /effort level when user picks "auto" or unset; "" = supportedEfforts[0]
   modelOverrides?: ProviderModelOverrideView[] | null;
+  recommendedUpgradeAvailable?: boolean; // official legacy OpenAI entry can switch to recommended Anthropic access
   modelCatalogFingerprint?: string; // opaque compare-and-apply token for background model discovery
 }
 
@@ -1630,6 +1731,7 @@ export interface ProviderModelOverrideView {
   defaultEffort: string;
   vision?: boolean | null;
   contextWindow?: number;
+  maxOutputTokens?: number;
 }
 
 // BalanceInfo is the wallet-balance readout (desktop/app.go Balance). available
@@ -1780,7 +1882,6 @@ export interface AgentView {
   maxSubagentConcurrency: number;
   maxParallelWriters: number;
   systemPrompt: string;
-  coldResumePrune: boolean;
   reasoningLanguage: string; // "auto" | "zh" | "en"
   compactRatio?: number; // Advanced global default; older backends omit it.
   effectiveCompactRatio?: number; // Active local session after project overrides.
@@ -2016,7 +2117,7 @@ export interface SettingsView {
   desktopThemeStyle: string;
   desktopTerminalTheme: string; // "auto" follows app | "dark" | "light"
   closeBehavior: string; // "background" | "quit"
-  displayMode: string;   // "standard" | "compact"
+  displayMode: string; reasoningDisplayMode: string; reasoningDisplayModeExplicit?: boolean;
   statusBarStyle: string; // "icon" | "text"
   statusBarItems: string[]; // ordered visible status bar item ids
   defaultToolApprovalMode: ToolApprovalMode | string; // default for newly-created sessions
@@ -2039,7 +2140,7 @@ export interface DesktopStartupSettingsView {
   desktopTheme: string; // "auto" | "dark" | "light"
   desktopThemeStyle: string;
   desktopTerminalTheme: string; // "auto" follows app | "dark" | "light"
-  displayMode: string;   // "standard" | "compact"
+  displayMode: string; reasoningDisplayMode: string; reasoningDisplayModeExplicit?: boolean;
   statusBarStyle: string; // "icon" | "text"
   statusBarItems: string[]; // ordered visible status bar item ids
   checkUpdates: boolean; // check for new versions on startup
@@ -2060,7 +2161,7 @@ export interface ExternalOpenerView {
 
 export interface ExternalOpenersView {
   openers: ExternalOpenerView[];
-  preferred: string;
+  preferred: string; workspaceOpenable?: boolean;
 }
 
 // Auto-updater payloads (desktop/updater.go). UpdateInfo drives the update banner;
