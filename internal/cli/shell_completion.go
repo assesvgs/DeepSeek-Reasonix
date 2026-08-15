@@ -46,8 +46,16 @@ func completionSpecWithAliases(name string, aliases []string, flags []cliComplet
 	return cliCompletionSpec{name: name, aliases: aliases, flags: flags, subcommands: subcommands}
 }
 
+func catalogCompletionSpec(help cliCompletionFlag) cliCompletionSpec {
+	reindex := make([]cliCompletionSpec, 0, len(catalogCommands))
+	for _, command := range catalogCommands {
+		flags := append(slices.Clone(command.completionFlags), help)
+		reindex = append(reindex, completionSpec(command.name, flags))
+	}
+	return completionSpec("catalogs", []cliCompletionFlag{help}, completionSpec("reindex", []cliCompletionFlag{help}, reindex...))
+}
+
 func cliCompletionRootSpec() cliCompletionSpec {
-	profile := completionFlag("--profile", cliCompletionStaticValue, "economy", "balanced", "delivery")
 	model := completionFlag("--model", cliCompletionModelValue)
 	resume := completionFlag("--resume -r", cliCompletionOptionalValue) // optional QUERY
 	effort := completionFlag("--effort", cliCompletionStaticValue, "auto", "low", "medium", "high", "max")
@@ -56,7 +64,7 @@ func cliCompletionRootSpec() cliCompletionSpec {
 	help := completionFlag("--help -h", cliCompletionNoValue)
 
 	interactiveFlags := []cliCompletionFlag{
-		model, profile,
+		model,
 		completionFlag("--max-steps", cliCompletionStaticValue),
 		completionFlag("--continue -c", cliCompletionNoValue),
 		resume,
@@ -71,7 +79,7 @@ func cliCompletionRootSpec() cliCompletionSpec {
 	// run/serve --resume require a value; only interactive root --resume [QUERY] is optional.
 	runResume := completionFlag("--resume", cliCompletionSessionValue)
 	runFlags := []cliCompletionFlag{
-		model, profile,
+		model,
 		completionFlag("--max-steps", cliCompletionStaticValue),
 		completionFlag("--show-thinking", cliCompletionNoValue),
 		completionFlag("--metrics", cliCompletionPathValue),
@@ -89,7 +97,6 @@ func cliCompletionRootSpec() cliCompletionSpec {
 		completionFlag("--ablate", cliCompletionStaticValue, "none", "all", "evidence", "planner", "subagent", "retrieval", "compaction"),
 		help,
 	}
-
 	root := cliCompletionSpec{name: "reasonix", flags: append([]cliCompletionFlag{
 		model,
 		completionFlag("--max-steps", cliCompletionStaticValue),
@@ -107,7 +114,7 @@ func cliCompletionRootSpec() cliCompletionSpec {
 		completionFlag("--version -v", cliCompletionNoValue),
 	}, help)}
 
-	serveFlags := cliServeCompletionFlags(model, profile, help)
+	serveFlags := cliServeCompletionFlags(model, help)
 
 	root.subcommands = []cliCompletionSpec{
 		completionSpec("run", runFlags),
@@ -124,7 +131,7 @@ func cliCompletionRootSpec() cliCompletionSpec {
 		),
 		completionSpec("init", []cliCompletionFlag{help}),
 		completionSpec("acp", []cliCompletionFlag{
-			model, profile,
+			model,
 			completionFlag("--planner", cliCompletionStaticValue, "auto", "off"),
 			completionFlag("--sandbox-network", cliCompletionStaticValue, "auto", "on", "off"),
 			completionFlag("--sandbox-bash", cliCompletionStaticValue, "auto", "enforce"),
@@ -201,17 +208,19 @@ func cliCompletionRootSpec() cliCompletionSpec {
 			completionSpec("try", []cliCompletionFlag{model, completionFlag("--max-steps --dir", cliCompletionStaticValue), help}),
 			completionSpec("run", []cliCompletionFlag{model, completionFlag("--max-steps --dir", cliCompletionStaticValue), help}),
 		),
-		completionSpec("doctor", []cliCompletionFlag{completionFlag("--json", cliCompletionNoValue), help},
-			completionSpec("repair", []cliCompletionFlag{
-				completionFlag("--root", cliCompletionStaticValue), completionFlag("--apply --project --json", cliCompletionNoValue), help,
+		doctorCompletionSpec(help),
+		completionSpec("sessions", []cliCompletionFlag{help},
+			completionSpec("reindex", []cliCompletionFlag{
+				completionFlag("--json", cliCompletionNoValue), completionFlag("--dir", cliCompletionPathValue), help,
 			}),
-			completionSpec("quality", []cliCompletionFlag{completionFlag("--json", cliCompletionNoValue), help}),
-			completionSpec("session", []cliCompletionFlag{completionFlag("--zip", cliCompletionNoValue), completionFlag("--out", cliCompletionStaticValue), help}),
-			completionSpec("redact-sessions", []cliCompletionFlag{completionFlag("--dry-run --json", cliCompletionNoValue), completionFlag("--dir", cliCompletionPathValue), help}),
-			completionSpec("capabilities", []cliCompletionFlag{
-				completionFlag("--root --timeout", cliCompletionStaticValue), completionFlag("--json --live", cliCompletionNoValue), help,
+			completionSpec("diagnose", []cliCompletionFlag{
+				completionFlag("--json", cliCompletionNoValue), completionFlag("--dir", cliCompletionPathValue), help,
+			}),
+			completionSpec("cleanup", []cliCompletionFlag{
+				completionFlag("--json --apply", cliCompletionNoValue), completionFlag("--dir", cliCompletionPathValue), help,
 			}),
 		),
+		catalogCompletionSpec(help),
 		completionSpec("report", []cliCompletionFlag{help},
 			completionSpec("list", []cliCompletionFlag{help}),
 			completionSpec("show", []cliCompletionFlag{help}),
@@ -285,9 +294,24 @@ func cliCompletionRootSpec() cliCompletionSpec {
 	return root
 }
 
-func cliServeCompletionFlags(model, profile, help cliCompletionFlag) []cliCompletionFlag {
+func doctorCompletionSpec(help cliCompletionFlag) cliCompletionSpec {
+	return completionSpec("doctor", []cliCompletionFlag{completionFlag("--json", cliCompletionNoValue), help},
+		completionSpec("sessions", []cliCompletionFlag{completionFlag("--json", cliCompletionNoValue), help}),
+		completionSpec("repair", []cliCompletionFlag{
+			completionFlag("--root", cliCompletionStaticValue), completionFlag("--apply --project --json", cliCompletionNoValue), help,
+		}),
+		completionSpec("quality", []cliCompletionFlag{completionFlag("--json", cliCompletionNoValue), help}),
+		completionSpec("session", []cliCompletionFlag{completionFlag("--zip", cliCompletionNoValue), completionFlag("--out", cliCompletionStaticValue), help}),
+		completionSpec("redact-sessions", []cliCompletionFlag{completionFlag("--dry-run --json", cliCompletionNoValue), completionFlag("--dir", cliCompletionPathValue), help}),
+		completionSpec("capabilities", []cliCompletionFlag{
+			completionFlag("--root --timeout", cliCompletionStaticValue), completionFlag("--json --live", cliCompletionNoValue), help,
+		}),
+	)
+}
+
+func cliServeCompletionFlags(model, help cliCompletionFlag) []cliCompletionFlag {
 	return []cliCompletionFlag{
-		model, profile,
+		model,
 		completionFlag("--max-steps --addr", cliCompletionStaticValue),
 		// Serve/Web resume accepts file paths, not branch IDs.
 		completionFlag("--resume", cliCompletionPathValue),

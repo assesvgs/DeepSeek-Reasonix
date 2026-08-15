@@ -50,7 +50,7 @@ func TestTaskToolReturnsSubAgentFinalAnswer(t *testing.T) {
 	if sys := sub.lastReq.Messages[0]; sys.Role != provider.RoleSystem || sys.Content != "test-sys-prompt" {
 		t.Errorf("first message = %+v, want system 'test-sys-prompt'", sys)
 	}
-	if got := lastUser(sub.lastReq); !strings.Contains(got, `<subagent-context event="SubagentStart">`) || !strings.Contains(got, "find callers of Foo") || !strings.HasSuffix(got, completeSubtaskContract) {
+	if got := lastUser(sub.lastReq); !strings.Contains(got, `<subagent-context event="SubagentStart">`) || !strings.Contains(got, "find callers of Foo") || !strings.Contains(got, completeSubtaskContract) {
 		t.Errorf("sub-agent user = %q, want SubagentStart context plus prompt", got)
 	}
 }
@@ -85,7 +85,7 @@ func TestTaskToolInjectsWorkspaceContextIntoSubagentPrompt(t *testing.T) {
 	if !strings.Contains(got, `<workspace-context event="SubagentWorkspace">`) ||
 		!strings.Contains(got, "Current workspace: "+strconv.Quote(workspace)) ||
 		!strings.Contains(got, `prefer "." or relative paths`) ||
-		!strings.Contains(got, "inspect project") || !strings.HasSuffix(got, completeSubtaskContract) {
+		!strings.Contains(got, "inspect project") || !strings.Contains(got, completeSubtaskContract) {
 		t.Fatalf("sub-agent user = %q, want workspace context plus prompt", got)
 	}
 }
@@ -894,8 +894,7 @@ func TestTaskToolBackgroundSalvagePublishesEvidenceForCollection(t *testing.T) {
 		finalText,
 	}}
 	task := NewTaskTool(sub, nil, reg, 20, 0, 0, 0, 0, 0, 0, 0.0, "", "sys", nil, 0, "", "", nil).
-		WithTranscripts(NewSubagentStore(t.TempDir()), t.TempDir(), "base-model", "base-effort").
-		WithDeliveryProfile(true)
+		WithTranscripts(NewSubagentStore(t.TempDir()), t.TempDir(), "base-model", "base-effort")
 
 	jm := jobs.NewManager(event.Discard)
 	defer jm.Close()
@@ -979,8 +978,8 @@ func TestBackgroundEvidenceNotCommittedWhenTurnFails(t *testing.T) {
 		{{Type: provider.ChunkText, Text: "all set"}, {Type: provider.ChunkDone}},
 		{{Type: provider.ChunkText, Text: "all set"}, {Type: provider.ChunkDone}},
 	}}
-	a := New(prov, reg, NewSession(""), Options{DeliveryProfile: true, Jobs: jm}, event.Discard)
-	ctx := jobs.WithManager(WithParentSession(context.Background(), "parent-session"), jm)
+	a := New(prov, reg, NewSession(""), Options{Jobs: jm}, event.Discard)
+	ctx := withClosedLoopContext(jobs.WithManager(WithParentSession(context.Background(), "parent-session"), jm))
 	ctx = jobs.WithSession(ctx, "parent-session")
 
 	err := a.Run(ctx, "collect and finish the background task")
@@ -1047,8 +1046,8 @@ func TestFailedTurnBackgroundMutationForcesReadinessOnNextRunWithoutWait(t *test
 		{{Type: provider.ChunkText, Text: "sure, here you go"}, {Type: provider.ChunkDone}},
 		{{Type: provider.ChunkText, Text: "sure, here you go"}, {Type: provider.ChunkDone}},
 	}}
-	a := New(prov, reg, NewSession(""), Options{DeliveryProfile: true, Jobs: jm}, event.Discard)
-	ctx := jobs.WithManager(WithParentSession(context.Background(), "parent-session"), jm)
+	a := New(prov, reg, NewSession(""), Options{Jobs: jm}, event.Discard)
+	ctx := withClosedLoopContext(jobs.WithManager(WithParentSession(context.Background(), "parent-session"), jm))
 	ctx = jobs.WithSession(ctx, "parent-session")
 
 	var readiness *FinalReadinessError
@@ -1099,8 +1098,8 @@ func TestRestartRecoversPendingBackgroundMutationForcesReadinessWithoutWait(t *t
 		{{Type: provider.ChunkText, Text: "all set"}, {Type: provider.ChunkDone}},
 		{{Type: provider.ChunkText, Text: "all set"}, {Type: provider.ChunkDone}},
 	}}
-	a := New(prov, reg, NewSession(""), Options{DeliveryProfile: true, Jobs: second}, event.Discard)
-	ctx := jobs.WithManager(WithParentSession(context.Background(), "parent-session"), second)
+	a := New(prov, reg, NewSession(""), Options{Jobs: second}, event.Discard)
+	ctx := withClosedLoopContext(jobs.WithManager(WithParentSession(context.Background(), "parent-session"), second))
 	ctx = jobs.WithSession(ctx, "parent-session")
 
 	var readiness *FinalReadinessError

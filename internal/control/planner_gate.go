@@ -9,12 +9,7 @@ import (
 	"unicode/utf8"
 
 	"reasonix/internal/agent"
-	"reasonix/internal/capability"
-)
-
-const (
-	plannerLightResearchRounds = 2
-	plannerFullResearchRounds  = 6
+	"reasonix/internal/taskpolicy"
 )
 
 const (
@@ -40,6 +35,7 @@ const (
 	plannerReasonAnchoredWork        = "anchored_work"
 	plannerReasonAmbiguousWork       = "ambiguous_work"
 	plannerReasonWorkRequest         = "work_request"
+	plannerReasonTaskPolicy          = "task_policy"
 	plannerReasonDefault             = "default_executor"
 )
 
@@ -55,8 +51,10 @@ type plannerTurnMetadata struct {
 	Synthetic              bool
 	ExplicitPlanMode       bool
 	GoalActive             bool
-	DeliveryProfile        bool
+	ClosedLoop             bool // legacy tests/callers without a frozen TaskPolicy
 	HasConversationContext bool
+	Policy                 taskpolicy.TaskPolicy
+	PolicySet              bool
 }
 
 type plannerTurnMetadataKey struct{}
@@ -74,13 +72,31 @@ func plannerTurnMetadataFromContext(ctx context.Context) (plannerTurnMetadata, b
 }
 
 func (c *Controller) withPlannerTurnMetadata(ctx context.Context, userText string, synthetic bool, priorMessages int) context.Context {
+	text := strings.TrimSpace(agent.StripTransientUserBlocks(userText))
+	features := plannerFeaturesFor(text, normalizePlannerText(text))
+	goalActive := c.goals.active()
+	policy := taskpolicy.Derive(taskpolicy.Input{
+		Raw:             text,
+		Instruction:     taskpolicy.StripQuotedConstraints(text),
+		PlanMode:        c.PlanMode(),
+		GoalActive:      goalActive,
+		HighRiskHints:   features.highRisk,
+		MediumRiskHints: features.complex,
+		MultiFile:       features.multiFile,
+		CrossSurface:    features.crossSurface,
+		Anchored:        features.anchored,
+		Structured:      features.structured,
+	})
+	ctx = taskpolicy.WithContext(ctx, policy)
 	return withPlannerTurnMetadata(ctx, plannerTurnMetadata{
 		UserText:               userText,
 		Synthetic:              synthetic,
 		ExplicitPlanMode:       c.PlanMode(),
-		GoalActive:             c.goals.active(),
-		DeliveryProfile:        c.runtimeProfile == capability.ProfileDelivery,
+		GoalActive:             goalActive,
+		ClosedLoop:             policy.ClosedLoop(),
 		HasConversationContext: priorMessages > 1,
+		Policy:                 policy,
+		PolicySet:              true,
 	})
 }
 
@@ -124,7 +140,7 @@ func DecidePlannerRoute(ctx context.Context, input string) agent.PlannerDecision
 	if hasLeadingDirective(lower, planAndExecuteDirectives) || hasLeadingDirective(lower, planFirstDirectives) {
 		return plannerPlanDecision(agent.PlannerRoutePlanAndExecute, agent.PlannerDepthFull, plannerReasonUserPlanAndExecute)
 	}
-	if requestsDirectExecution(lower) {
+	if requestsDirectExecution(lower) && (!meta.PolicySet || meta.Policy.Route == taskpolicy.RouteDirect) {
 		return plannerExecutorDecision(plannerReasonUserDirect)
 	}
 	if meta.HasConversationContext && isContextDependentAction(text) {
@@ -135,6 +151,19 @@ func DecidePlannerRoute(ctx context.Context, input string) agent.PlannerDecision
 	}
 
 	features := plannerFeaturesFor(text, lower)
+	if meta.PolicySet {
+		if meta.GoalActive && features.work && !features.atomic {
+			return plannerPlanDecision(agent.PlannerRoutePlanAndExecute, agent.PlannerDepthFull, plannerReasonGoalActive)
+		}
+		switch meta.Policy.Route {
+		case taskpolicy.RouteFullPlan:
+			return plannerPlanDecision(agent.PlannerRoutePlanAndExecute, agent.PlannerDepthFull, plannerReasonTaskPolicy)
+		case taskpolicy.RouteLightPlan:
+			return plannerPlanDecision(agent.PlannerRoutePlanAndExecute, agent.PlannerDepthLight, plannerReasonTaskPolicy)
+		default:
+			return plannerExecutorDecision(plannerReasonTaskPolicy)
+		}
+	}
 	if features.work && features.highRisk {
 		return plannerPlanDecision(agent.PlannerRoutePlanAndExecute, agent.PlannerDepthFull, plannerReasonHighRisk)
 	}
@@ -159,7 +188,7 @@ func DecidePlannerRoute(ctx context.Context, input string) agent.PlannerDecision
 	if meta.GoalActive && features.work {
 		return plannerPlanDecision(agent.PlannerRoutePlanAndExecute, agent.PlannerDepthFull, plannerReasonGoalActive)
 	}
-	if meta.DeliveryProfile && features.work {
+	if meta.ClosedLoop && features.work {
 		return plannerPlanDecision(agent.PlannerRoutePlanAndExecute, agent.PlannerDepthFull, plannerReasonWorkRequest)
 	}
 	if features.work && features.ambiguous {
@@ -183,15 +212,10 @@ func plannerExecutorDecision(reason string) agent.PlannerDecision {
 }
 
 func plannerPlanDecision(route agent.PlannerRoute, depth agent.PlannerDepth, reason string) agent.PlannerDecision {
-	rounds := plannerLightResearchRounds
-	if depth == agent.PlannerDepthFull {
-		rounds = plannerFullResearchRounds
-	}
 	return agent.PlannerDecision{
-		Route:             route,
-		Depth:             depth,
-		Reason:            reason,
-		MaxResearchRounds: rounds,
+		Route:  route,
+		Depth:  depth,
+		Reason: reason,
 	}
 }
 

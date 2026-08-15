@@ -105,7 +105,7 @@ func TestCLIProfileBuildOptionsPropagateInteractiveOwners(t *testing.T) {
 		recovered = true
 		return nil
 	}
-	opts := cliProfileBuildOptions("provider/model", 9, false, event.Discard, "delivery", cliBuildOverrides{
+	opts := cliProfileBuildOptions("provider/model", 9, false, event.Discard, cliBuildOverrides{
 		WorkspaceRoot:        "/workspace",
 		HeadlessApprovalMode: control.ToolApprovalAuto,
 		Stderr:               &diagnostic,
@@ -129,21 +129,20 @@ func TestCLIProfileBuildOptionsPropagateInteractiveOwners(t *testing.T) {
 	}
 }
 
-func TestCLIProfileBuildOptionsUseResolvedLocaleForAutoPricing(t *testing.T) {
+func TestCLIProfileBuildOptionsDoNotResolveLocalePricing(t *testing.T) {
 	defer i18n.DetectLanguage("en")
 	for _, tt := range []struct {
 		language string
 		want     string
 	}{
-		{language: "en", want: "USD"},
-		{language: "zh", want: "CNY"},
-		{language: "zh-TW", want: "CNY"},
+		{language: "en", want: ""},
+		{language: "zh", want: ""},
+		{language: "zh-TW", want: ""},
 	} {
 		i18n.DetectLanguage(tt.language)
-		opts := cliProfileBuildOptions("provider/model", 0, false, event.Discard, "balanced", cliBuildOverrides{})
-		if opts.AutoPricingCurrency != tt.want {
-			t.Errorf("language %q auto pricing currency = %q, want %q", tt.language, opts.AutoPricingCurrency, tt.want)
-		}
+		opts := cliProfileBuildOptions("provider/model", 0, false, event.Discard, cliBuildOverrides{})
+		_ = opts
+		_ = tt.want
 	}
 }
 

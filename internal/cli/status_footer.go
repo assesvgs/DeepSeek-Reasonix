@@ -32,10 +32,6 @@ func footerInfo(value string) string {
 	return themeFg(activeCLITheme.info, value)
 }
 
-func footerSecondary(value string) string {
-	return themeFg(activeCLITheme.secondary, value)
-}
-
 func footerMetric(label, value string) string {
 	if strings.TrimSpace(value) == "" {
 		return ""
@@ -74,7 +70,13 @@ func renderTurnReceipt(u *provider.Usage, p *provider.Pricing, d *event.CacheDia
 		groups = append(groups, "reasoning "+shortTokens(u.ReasoningTokens))
 	}
 	if p != nil {
-		groups = append(groups, fmt.Sprintf("%s%.4f", p.Symbol(), p.Cost(u)))
+		// Host quotes are estimates; never present a bare zero as real spend.
+		cost := p.Cost(u)
+		if cost > 0 {
+			groups = append(groups, fmt.Sprintf("≈%s%.4f", p.Symbol(), cost))
+		} else {
+			groups = append(groups, "cost n/a")
+		}
 	}
 	if u.Estimated {
 		groups = append(groups, "estimated")
@@ -147,10 +149,6 @@ func (m chatTUI) statusModelWorkGroup(maxWidth int) string {
 		return ""
 	}
 	model := strings.TrimSpace(m.label)
-	work := ""
-	if m.runtimeProfile != "" {
-		work = runtimeProfileDisplay(m.runtimeProfile)
-	}
 	if maxWidth <= 0 {
 		maxWidth = 1
 	}
@@ -159,9 +157,6 @@ func (m chatTUI) statusModelWorkGroup(maxWidth int) string {
 	tail := make([]string, 0, 2)
 	if effort := m.effortTag(); effort != "" {
 		tail = append(tail, effort)
-	}
-	if work != "" {
-		tail = append(tail, footerMetric(i18n.M.ChatStatusWorkLabel, footerSecondary(work)))
 	}
 	if model == "" && len(tail) == 0 {
 		return ""

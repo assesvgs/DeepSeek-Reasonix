@@ -29,6 +29,7 @@ import (
 
 	"reasonix/internal/ablation"
 	"reasonix/internal/agent"
+	"reasonix/internal/agentpreset"
 	"reasonix/internal/autoresearch"
 	"reasonix/internal/billing"
 	"reasonix/internal/capability"
@@ -66,6 +67,11 @@ import (
 // while one is already active in the same Controller.
 var ErrTurnRunning = errors.New("turn already running")
 
+// ErrNoFinalReadinessRecovery means an explicit continuation did not match the
+// immediately preceding paused readiness check (for example, an old card after
+// a newer user turn). It must not silently become an ordinary turn.
+var ErrNoFinalReadinessRecovery = errors.New("no pending final-readiness check to continue")
+
 // ErrRuntimeDraining reports that a caller targeted a controller generation
 // superseded by a successful rebuild.
 var ErrRuntimeDraining = errors.New("runtime is draining after rebuild")
@@ -94,6 +100,11 @@ type Controller struct {
 	// recoveryGate is the shared Auto Guard state for this controller.
 	// nil when the feature is not wired for this controller.
 	recoveryGate *recovery.Gate
+
+	// taskBudget is the configured spend gate, as passed at construction.
+	taskBudget agent.TaskBudget
+	// goalTokenBudget bounds an unattended Goal loop; 0 leaves it unbounded.
+	goalTokenBudget int
 	// evaluator is the bounded Goal completion evaluator consulted when the
 	// working model submits no update_goal report. nil fails closed: the goal
 	// pauses instead of defaulting to continue.
@@ -143,8 +154,10 @@ type Controller struct {
 	closeOnce                         sync.Once                        // makes close idempotent under racing teardown paths
 	onRemember                        func(rule string) RememberResult // set via Options; invoked when user picks "always allow"
 	onRememberPlanModeReadOnlyCommand func(prefix string) PlanModeReadOnlyCommandTrustResult
+	writeAccess                       controllerWriteAccess
 	sessionRecoveryMeta               func(SessionRecoveryRequest) agent.BranchMeta
 	onSessionRecovered                func(SessionRecoveryInfo) error
+	onSessionTransition               func(SessionTransitionInfo) error
 
 	// balanceURL/balanceKey target the active provider's optional wallet-balance
 	// endpoint (empty when the provider declares none). Captured at build so a
@@ -202,10 +215,9 @@ type Controller struct {
 	// transient route block (Delivery and dual-model Planner).
 	capabilityProxy bool
 	// proxyToolsFn returns live tools observed through use_capability without
-	// entering the provider-visible registry (Balanced dual-model Planner).
-	proxyToolsFn   func() map[string][]plugin.CachedTool
-	runtimeProfile capability.Profile
-	ablation       ablation.Set
+	// entering the provider-visible registry (dual-model Planner).
+	proxyToolsFn func() map[string][]plugin.CachedTool
+	ablation     ablation.Set
 
 	// goals owns the active goal's FSM (status, intercepts, idle/turn counters)
 	// and its persistence, behind its own mutex so a per-turn goal save never
@@ -254,11 +266,12 @@ type Controller struct {
 
 	// mu guards the run state; every critical section under it is short and
 	// non-blocking.
-	mu        sync.Mutex
-	cancel    context.CancelFunc
-	running   bool
-	finishing bool // TurnDone is still being delivered; park a replacement turn
-	canceling bool
+	mu                sync.Mutex
+	cancel            context.CancelFunc
+	running           bool
+	finishing         bool // TurnDone is still being delivered; park a replacement turn
+	finishingBoundary turnFinishingBoundary
+	canceling         bool
 	// closed marks the controller as terminally torn down (close() ran). It
 	// seals turn admission: without it, a submit arriving AFTER close cleared
 	// the parked queue — but while a still-running turn's TurnDone delivery
@@ -284,11 +297,6 @@ type Controller struct {
 	// by Bash calls. Retained for this Controller's lifetime; rotated on
 	// /new, /clear, resume of another session, and branch switches.
 	sessionTemp *sessiontemp.Manager
-	// recoveryDepthCapNotices records session paths that already surfaced the
-	// depth-cap recovery warning. Repeated saves on the same conflict copy are
-	// diagnostic noise for the UI; keep logging/diagnostics, but emit the user
-	// notice once per controller/session path.
-	recoveryDepthCapNotices map[string]bool
 	// snapshotMu serializes the whole save/recovery handoff for this controller.
 	// Agent-level path locks protect individual files, but recovery also moves
 	// controller-owned state (sessionPath, guardianPath, checkpoints, rewrite
@@ -311,9 +319,11 @@ type Controller struct {
 }
 
 type approvalReply struct {
-	allow   bool
-	session bool
-	persist bool // true = write "always allow" rule to config
+	allow      bool
+	session    bool
+	persist    bool // true = write "always allow" rule to config
+	onceDirs   []string
+	persistErr error
 }
 
 type pendingApproval struct {
@@ -325,8 +335,9 @@ type pendingApproval struct {
 	fresh        bool
 	requireHuman bool
 	autoDrain    bool
-	kind         string // tool | plan | recovery; empty = tool
+	kind         string // tool | plan | recovery | write_access; empty = tool
 	recovery     *event.RecoveryApproval
+	writeAccess  *event.WriteAccessApproval
 	reply        chan approvalReply
 }
 
@@ -336,6 +347,7 @@ type pendingApproval struct {
 type pendingAsk struct {
 	questions []event.AskQuestion
 	reply     chan []event.AskAnswer
+	queued    bool // registered but not yet shown; replay must skip it
 }
 
 type plannerSessionResetter interface {
@@ -416,6 +428,10 @@ type Options struct {
 	// RecoveryHeadless blocks mutations that need confirmation instead of
 	// waiting forever when no human decision channel exists.
 	RecoveryHeadless bool
+	// TaskBudget is the configured spend gate; unset leaves a turn unbounded.
+	TaskBudget agent.TaskBudget
+	// GoalTokenBudget bounds an unattended Goal loop by cumulative tokens.
+	GoalTokenBudget int
 	// GoalEvaluator is the optional bounded Goal completion evaluator consulted
 	// when the working model submits no update_goal report. nil fails closed:
 	// the goal pauses instead of defaulting to continue.
@@ -461,6 +477,10 @@ type Options struct {
 	BalanceClient *http.Client
 	// Jobs is the session-scoped background-job manager (nil disables background jobs).
 	Jobs *jobs.Manager
+	// TaskStore remains a FileStore-compatible authority. Desktop injects one
+	// observed instance so recorder and task-control APIs share post-commit
+	// projection hints; nil preserves the ordinary FileStore.
+	TaskStore taskmonitor.WriteStore
 	// WorkspaceLease is the Delivery writer owner shared with the executor.
 	WorkspaceLease *workspacelease.Owner
 	// Registry is the executor's live tool set, and PluginCtx the session-scoped
@@ -507,20 +527,30 @@ type Options struct {
 	// read-only when the user chooses "always allow" from the plan-mode trust
 	// prompt.
 	OnRememberPlanModeReadOnlyCommand func(prefix string) PlanModeReadOnlyCommandTrustResult
+	// OnPersistWriteAccess writes sandbox.allow_write and an optional permission
+	// rule to the workspace reasonix.toml as one transaction.
+	OnPersistWriteAccess PersistWriteAccessFunc
+	// WriteRoots is the session-scoped writable directory manager shared with
+	// built-in file tools and bash.
+	WriteRoots *sandbox.WritableRootSet
+	// BashSandboxEnforced is true when this session's bash tool actually wraps
+	// commands in an OS sandbox. Windows and bash=off leave this false so
+	// directory prompts are not implied for unisolated shell writes.
+	BashSandboxEnforced bool
 	// SessionRecoveryMeta lets a frontend attach scope/topic/profile metadata to
 	// an automatic recovery branch before it is written.
 	SessionRecoveryMeta func(SessionRecoveryRequest) agent.BranchMeta
 	// OnSessionRecovered is called after a stale runtime's transcript has been
 	// saved as a recovery branch, before the controller commits to that branch.
 	OnSessionRecovered func(SessionRecoveryInfo) error
+	// OnSessionTransition transfers write ownership before an intentional
+	// fork, branch, or switch publishes a different Session.
+	OnSessionTransition func(SessionTransitionInfo) error
 	// ApprovalTimeout bounds how long a tool-approval or ask prompt blocks waiting
 	// for a user decision. Zero (default) waits forever — right for an interactive
 	// terminal. Bot/headless frontends set a positive value so an unanswered
 	// prompt can't wedge the session indefinitely (#4626, #4402).
 	ApprovalTimeout time.Duration
-	// RuntimeProfile selects capability routing/filtering behavior. Empty keeps
-	// the backward-compatible Balanced profile.
-	RuntimeProfile capability.Profile
 	// Extensions is the frozen extension dispatcher for this controller
 	// generation (Extension Protocol v2, stage 6b1). Nil means no v2 runtime
 	// packages are installed: every extension wiring point takes an untouched
@@ -546,6 +576,13 @@ type Options struct {
 // New builds a Controller. A nil Sink becomes event.Discard; unless the caller
 // already provided a goalUsageTee (NewGoalUsageTee), the sink is wrapped in one
 // so billable usage can be accounted to Goal budgets.
+func controllerSessionTemp(existing *sessiontemp.Manager) *sessiontemp.Manager {
+	if existing != nil {
+		return existing
+	}
+	return sessiontemp.New()
+}
+
 func New(opts Options) *Controller {
 	sink := opts.Sink
 	if nilutil.IsNil(sink) {
@@ -562,14 +599,13 @@ func New(opts Options) *Controller {
 	}
 	runtimeOwner := runtimeOwnerOrDefault(opts.RuntimeOwner)
 	pluginCtx = extension.ContextWithRuntimeOwner(pluginCtx, runtimeOwner)
-	runtimeProfile := opts.RuntimeProfile
-	if runtimeProfile == "" {
-		runtimeProfile = capability.ProfileBalanced
-	}
 	if opts.Hooks != nil {
 		opts.Hooks.SetSessionID(agent.BranchID(opts.SessionPath))
 	}
 	c := &Controller{
+		taskBudget:                        opts.TaskBudget,
+		goalTokenBudget:                   opts.GoalTokenBudget,
+		goals:                             goalMachine{tokenBudget: opts.GoalTokenBudget},
 		runner:                            opts.Runner,
 		executor:                          opts.Executor,
 		guardianSess:                      opts.Guardian,
@@ -599,8 +635,10 @@ func New(opts Options) *Controller {
 		shell:                             opts.Shell,
 		onRemember:                        opts.OnRemember,
 		onRememberPlanModeReadOnlyCommand: opts.OnRememberPlanModeReadOnlyCommand,
+		writeAccess:                       newControllerWriteAccess(opts),
 		sessionRecoveryMeta:               opts.SessionRecoveryMeta,
 		onSessionRecovered:                opts.OnSessionRecovered,
+		onSessionTransition:               opts.OnSessionTransition,
 		balanceURL:                        opts.BalanceURL,
 		balanceKey:                        opts.BalanceKey,
 		balanceClient:                     opts.BalanceClient,
@@ -610,7 +648,6 @@ func New(opts Options) *Controller {
 		mcpDefaultCallTimeout:             opts.MCPDefaultCallTimeout,
 		mcpConfigureSpec:                  opts.MCPConfigureSpec,
 		capabilityRuntime:                 opts.CapabilityRuntime,
-		runtimeProfile:                    runtimeProfile,
 		ablation:                          opts.Ablation,
 		workspaceRoot:                     opts.WorkspaceRoot,
 		externalFolderToolRefs:            opts.ExternalFolderToolRefs,
@@ -622,13 +659,8 @@ func New(opts Options) *Controller {
 	// Session-private temporary directory: reuse a shared Manager on hot
 	// rebuild, otherwise create one. Retain so ReleaseResources/Close drop the
 	// owner reference without racing a replacement Controller.
-	if opts.SessionTemp != nil {
-		c.sessionTemp = opts.SessionTemp
-	} else {
-		c.sessionTemp = sessiontemp.New()
-	}
+	c.sessionTemp = controllerSessionTemp(opts.SessionTemp)
 	c.sessionTemp.Retain()
-
 	if strings.TrimSpace(opts.WorkspaceRoot) != "" {
 		c.legacyResearchArchive = legacyResearchArchive{store: autoresearch.NewStore(opts.WorkspaceRoot)}
 	}
@@ -666,8 +698,12 @@ func New(opts Options) *Controller {
 	// must never affect the agent pipeline. The session id is resolved lazily
 	// because the session path is only fixed once the first turn begins.
 	if c.jobs != nil && c.workspaceRoot != "" {
+		taskStore := opts.TaskStore
+		if taskStore == nil {
+			taskStore = taskmonitor.NewFileStore(filepath.Join(".reasonix", "tasks"))
+		}
 		c.jobs.SetTaskRecorder(taskmonitor.NewTaskRecorder(
-			taskmonitor.NewFileStore(filepath.Join(".reasonix", "tasks")),
+			taskStore,
 			c.workspaceRoot,
 			func() string { return c.parentSessionID() },
 		))
@@ -809,6 +845,19 @@ func (c *Controller) ToolContractEntries() []tool.ContractEntry {
 	return reg.ContractEntries()
 }
 
+// AllToolContractEntries returns every registered tool, including those hidden
+// from the provider-visible schema and only reachable via use_capability.
+func (c *Controller) AllToolContractEntries() []tool.ContractEntry {
+	if c == nil {
+		return nil
+	}
+	reg := c.mcp.registry()
+	if reg == nil {
+		return nil
+	}
+	return reg.AllContractEntries()
+}
+
 // ProviderCatalog returns the session's merged provider catalog: the config
 // (or broker) base plus every provider a live extension sidecar declared,
 // keyed by ref — extension refs carry their plugin/<plugin>/<provider>/<model>
@@ -932,6 +981,7 @@ func (c *Controller) finishGuardedTurn(err error, completion *guardedTurnComplet
 	// Close has already sealed admission permanently, so a late completion must
 	// not resurrect a finishing state after teardown.
 	c.finishing = !c.closed
+	c.finishingBoundary.begin(c.finishing)
 	c.cancel = nil
 	c.canceling = false
 	c.mu.Unlock()
@@ -939,6 +989,7 @@ func (c *Controller) finishGuardedTurn(err error, completion *guardedTurnComplet
 	defer func() {
 		c.mu.Lock()
 		c.finishing = false
+		c.finishingBoundary.end()
 		if c.closed {
 			c.mu.Unlock()
 			return
@@ -1199,19 +1250,6 @@ func (c *Controller) SubmitDisplay(display, input string) {
 	c.submit(input, display, "")
 }
 
-// SubmitDeliveryRecovery runs the same visible prompt path as SubmitDisplay but
-// first authorizes the executor to retain the immediately preceding exhausted
-// delivery ledger. The agent consumes that authorization once; if the card came
-// from an older/reloaded session this safely degrades to an ordinary turn.
-func (c *Controller) SubmitDeliveryRecovery(display, input string) {
-	c.runGuarded(func(ctx context.Context) error {
-		if c.executor != nil {
-			c.executor.PrepareDeliveryRecovery()
-		}
-		return c.runGoalLoopWithRawDisplay(ctx, input, input, display)
-	})
-}
-
 // SubmitInvocationDisplay executes composer-selected invocation entities
 // independently of slash-command parsing. Plain string submit entry points keep
 // their existing behavior for CLI, HTTP, and backward-compatible clients.
@@ -1361,7 +1399,7 @@ func (c *Controller) submitHTTPWithFormat(input, display, format string) {
 	c.submitCommandOrTurn(trimmed, input, display, true, "", format)
 }
 
-func (c *Controller) submitCommandOrTurn(trimmed, input, display string, scopedRefsOnly bool, editedOriginal, format string) {
+func (c *Controller) submitCommandOrTurnReady(trimmed, input, display string, scopedRefsOnly bool, editedOriginal, format string) {
 	runRefTurn := func(input, display string) {
 		c.runRefTurnWithFormat(input, display, format)
 	}
@@ -1389,6 +1427,9 @@ func (c *Controller) submitCommandOrTurn(trimmed, input, display string, scopedR
 		runGoalLoop = func(ctx context.Context, input, raw, display string) error {
 			return c.runEditedGoalLoopWithRawDisplay(ctx, input, raw, display, editedOriginal)
 		}
+	}
+	if c.submitFinalReadinessCommand(trimmed, display) {
+		return
 	}
 	switch {
 	case trimmed == "/compact" || strings.HasPrefix(trimmed, "/compact "):
@@ -1586,8 +1627,8 @@ func (c *Controller) applyGoalCommand(input, display string) bool {
 		rt := c.GoalRuntime()
 		c.notice(fmt.Sprintf(i18n.M.GoalCurrentFmt, goal))
 		c.notice(fmt.Sprintf(i18n.M.GoalRuntimeFmt,
-			rt.TurnsUsed, rt.TurnsLimit, rt.TokensUsed, rt.RequestsUsed,
-			rt.NoProgressTurns, rt.BudgetExtensions))
+			rt.TurnsUsed, rt.RequestsUsed, rt.TokensUsed,
+			GoalWorkDurationText(rt.WorkDurationMs)))
 		if rt.LastReason != "" {
 			c.noticeDetail(i18n.M.GoalRuntimeLastReason, rt.LastReason)
 		}
@@ -1913,7 +1954,7 @@ func (c *Controller) noticeDetail(text, detail string) {
 // Run executes a turn synchronously, returning the agent's error. Used by the
 // headless `reasonix run` path, where the Sink renders to stdout and the caller
 // just needs the exit status — no TurnDone event, no cancel bookkeeping.
-func (c *Controller) Run(ctx context.Context, input string) (err error) {
+func (c *Controller) runReady(ctx context.Context, input string) (err error) {
 	ctx = extension.ContextWithRuntimeOwner(ctx, c.RuntimeOwner())
 	if c.RuntimePhase() == RuntimePhaseDraining {
 		c.emitDrainingNotice()
@@ -2025,13 +2066,6 @@ func (c *Controller) Cancel() {
 	}
 }
 
-// Running reports whether a turn is currently in flight.
-func (c *Controller) Running() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.running || c.finishing
-}
-
 // beginRotation claims the session-rotation gate. It fails if a turn is running
 // or another rotation is already in progress, so the caller holds exclusive
 // rights to swap the executor session from the check here through endRotation.
@@ -2049,12 +2083,6 @@ func (c *Controller) beginRotation() error {
 	}
 	c.rotating = true
 	return nil
-}
-
-func (c *Controller) endRotation() {
-	c.mu.Lock()
-	c.rotating = false
-	c.mu.Unlock()
 }
 
 // CancelRequested reports whether Cancel has been requested for the active turn.
@@ -2093,53 +2121,6 @@ func (c *Controller) Turn() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.turn
-}
-
-// Approve answers a pending ApprovalRequest by ID: allow runs the call, session
-// also remembers a grant for the rest of the session so the same approval scope
-// is not re-prompted. Unknown/expired IDs are ignored.
-func (c *Controller) Approve(id string, allow, session, persist bool) {
-	// Recovery cards are strict fresh decisions. Prefer ResolveRecovery so a
-	// continue/deny from an old client that only knows Approve still maps onto
-	// the recovery state machine (allow=continue, deny=revise without feedback).
-	// Session/persist grants are intentionally ignored for recovery.
-	//
-	// Lookup must use the live waiter table (HasApproval), not Snapshot: pre-
-	// normal-execution plan prompts park a waiter without an armed taskRuntime, so
-	// they never appear in the persistence snapshot.
-	c.mu.Lock()
-	gate := c.recoveryGate
-	c.mu.Unlock()
-	if gate != nil && gate.HasApproval(id) {
-		action := agent.RecoveryActionRevise
-		if allow {
-			action = agent.RecoveryActionContinue
-		}
-		_ = c.ResolveRecovery(id, action, "")
-		return
-	}
-	pending := c.approval.resolve(id)
-	if pending.reply == nil {
-		return
-	}
-	outcome := "deny"
-	if pending.tool == planApprovalTool {
-		outcome = string(PlanDecisionRevisePlan)
-		if allow {
-			outcome = string(PlanDecisionStartExecution)
-		}
-	} else if allow {
-		switch {
-		case persist:
-			outcome = "allow_persistent"
-		case session:
-			outcome = "allow_session"
-		default:
-			outcome = "allow_once"
-		}
-	}
-	c.recordDecisionReceipt(pending, outcome)
-	pending.reply <- approvalReply{allow: allow, session: session, persist: persist} // buffered, never blocks
 }
 
 // ResolvePlanDecision answers the Plan card without collapsing revise and exit
@@ -2206,11 +2187,14 @@ func (c *Controller) EnableInteractiveApproval() {
 	trustGate := planModeReadOnlyTrustApprover{c}
 	escapeApprover := sandboxEscapeApprover{c}
 	configApprover := managedConfigWriteApprover{c}
+	c.writeAccess.interactive = true
 	if c.executor != nil {
 		c.executor.SetGate(c.newInteractiveGate())
 		c.executor.SetPlanModeReadOnlyTrustGate(trustGate)
 		c.executor.SetSandboxEscapeApprover(escapeApprover)
 		c.executor.SetConfigWriteApprover(configApprover)
+		c.executor.SetWriteAccessGate(c)
+		c.executor.SetWriteRoots(c.writeAccess.roots)
 		c.executor.SetAsker(c)
 	}
 	if setter, ok := c.runner.(interface {
@@ -2227,6 +2211,16 @@ func (c *Controller) EnableInteractiveApproval() {
 		SetConfigWriteApprover(tool.ConfigWriteApprover)
 	}); ok {
 		setter.SetConfigWriteApprover(configApprover)
+	}
+	if setter, ok := c.runner.(interface {
+		SetWriteAccessGate(agent.WriteAccessGate)
+	}); ok {
+		setter.SetWriteAccessGate(c)
+	}
+	if setter, ok := c.runner.(interface {
+		SetWriteRoots(*sandbox.WritableRootSet)
+	}); ok {
+		setter.SetWriteRoots(c.writeAccess.roots)
 	}
 	if setter, ok := c.runner.(interface {
 		SetPlannerPlanApprover(agent.PlannerPlanApprover)
@@ -2277,17 +2271,17 @@ func (c *Controller) newInteractiveGate() *permission.Gate {
 	default:
 		policy.Mode = permission.Ask
 	}
-	// A session allowlist (e.g. --allowed-tools) must never satisfy a tool that
-	// requires fresh human approval on every call — memory remember/forget, plan
-	// approval, sandbox escape, managed config write. SessionAllow is checked
-	// before Ask in Policy.Decide, so leaving those entries in would let
-	// `--allowed-tools remember` write memory with no prompt. Strip them so the
-	// forced Ask rules below stay authoritative.
+	// SessionAllow must not cover fresh-human tools: it is checked before Ask,
+	// so `--allowed-tools remember` would skip the prompt. Interactive Auto and
+	// YOLO treat remember/forget as ordinary policy decisions; Auto still
+	// preserves an explicit configured Ask rule, while YOLO bypasses it.
 	policy.SessionAllow = rulesWithoutFreshHumanApproval(policy.SessionAllow)
-	policy.Ask = append(policy.Ask,
-		permission.Rule{Tool: memoryRememberTool},
-		permission.Rule{Tool: memoryForgetTool},
-	)
+	if mode != ToolApprovalAuto && mode != ToolApprovalYolo {
+		policy.Ask = append(policy.Ask,
+			permission.Rule{Tool: memoryRememberTool},
+			permission.Rule{Tool: memoryForgetTool},
+		)
+	}
 	var approver permission.Approver = gateApprover{c}
 	if mode == ToolApprovalDontAsk {
 		approver = denyPermissionApprover{}
@@ -2370,8 +2364,11 @@ func (c *Controller) ApplyHeadlessApprovalMode(mode string) {
 	if c.subagentGate != nil {
 		c.subagentGate.Update(mode)
 	}
+	c.writeAccess.interactive = false
 	if c.executor != nil {
 		c.executor.SetGate(c.newHeadlessGate(mode))
+		c.executor.SetWriteAccessGate(c)
+		c.executor.SetWriteRoots(c.writeAccess.roots)
 	}
 }
 
@@ -2427,6 +2424,45 @@ func (c *Controller) SteerConsumed() bool {
 	return true
 }
 
+// promptQueueNoticeDelay is how long a prompt may wait behind another before
+// the user is told why nothing has appeared. Short enough to beat "it's stuck",
+// long enough that an approval answered promptly never emits a notice.
+var promptQueueNoticeDelay = 3 * time.Second
+
+// lockPromptFor acquires the prompt lock, emitting one notice if the wait is
+// long enough to look like a hang. It reports false only when ctx ended first;
+// the lock is held on true.
+func (c *Controller) lockPromptFor(ctx context.Context, kind string) bool {
+	acquired := make(chan struct{})
+	go func() {
+		c.approval.promptMu.Lock()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		return true
+	case <-ctx.Done():
+	case <-time.After(promptQueueNoticeDelay):
+	}
+	if ctx.Err() == nil {
+		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodePromptQueued,
+			Text:   "A " + kind + " is waiting for you to answer the prompt ahead of it.",
+			Detail: "the assistant asked something while an earlier approval or question was still open; it appears once that one is answered"})
+	}
+	select {
+	case <-acquired:
+		return true
+	case <-ctx.Done():
+		// The lock may still be handed to the goroutine above; release it so the
+		// next prompt is not blocked by this abandoned wait.
+		go func() {
+			<-acquired
+			c.approval.promptMu.Unlock()
+		}()
+		return false
+	}
+}
+
 // Ask implements agent.Asker: it emits an AskRequest and blocks until
 // AnswerQuestion(ID, …) answers or ctx is cancelled. promptMu serialises it
 // against tool-approval prompts so at most one user prompt is outstanding.
@@ -2434,11 +2470,18 @@ func (c *Controller) SteerConsumed() bool {
 // tool exists to get a genuine user decision, and YOLO only auto-approves
 // tool calls; it must not answer the user's questions for them.
 func (c *Controller) Ask(ctx context.Context, questions []event.AskQuestion) ([]event.AskAnswer, error) {
-	c.approval.promptMu.Lock()
+	// Registering after the lock left a queued question invisible everywhere:
+	// no event, absent from the snapshot, unreachable by ReplayPendingPrompts.
+	id, reply := c.approval.registerAsk(questions)
+
+	if !c.lockPromptFor(ctx, "question") {
+		c.approval.cancelAsk(id)
+		return nil, ctx.Err()
+	}
 	defer c.approval.promptMu.Unlock()
 
 	c.approval.promptEmitMu.Lock()
-	id, reply := c.approval.registerAsk(questions)
+	c.approval.markAskEmitted(id)
 	c.sink.Emit(event.Event{Kind: event.AskRequest, Ask: event.Ask{ID: id, Questions: questions}})
 	c.approval.promptEmitMu.Unlock()
 
@@ -2587,6 +2630,24 @@ func (c *Controller) SetPlanMode(v bool) {
 	c.applyPlanMode(v)
 }
 
+// SetAgentPreset is a deprecated compatibility shim. Reasonix runs one
+// adaptive standard execution; the preset no longer exists at runtime. The
+// call is accepted, validated for diagnostics, and ignored: it never rebuilds
+// the agent, never changes tool schemas, and never alters planning,
+// verification, or review behavior.
+func (c *Controller) SetAgentPreset(preset string) {
+	if c == nil {
+		return
+	}
+	_ = agentpreset.Normalize(preset)
+}
+
+// AgentPreset returns the fixed compatibility label. One-version-old clients
+// read it from status snapshots; new code must not branch on it.
+func (c *Controller) AgentPreset() string {
+	return string(agentpreset.Balanced)
+}
+
 func (c *Controller) applyPlanMode(v bool) {
 	c.mu.Lock()
 	c.planMode = v
@@ -2732,28 +2793,28 @@ func (c *Controller) resolveGoalText(goal string, researchMode GoalResearchMode)
 }
 
 // ResumeGoal re-enters a recoverable blocked/stopped Goal without resetting its
-// delivery evidence scope. A budget-paused Goal gets one extra slice of its
-// budget class; accumulated consumption is preserved.
+// delivery evidence scope or accumulated usage statistics.
 func (c *Controller) ResumeGoal() bool {
 	if handled, resumed := c.retryBlockedLegacyGoal(); handled {
 		return resumed
 	}
-	path, data, persist, resumed, extended := c.goals.resume(c.goalTodos())
+	spentBudget := c.goals.runtimeView().StopCause == stopCauseBudgetSpend
+	path, data, persist, resumed := c.goals.resume(c.goalTodos())
 	if !resumed {
 		return false
 	}
 	c.persistGoalState(path, data, persist)
-	if extended {
-		c.notice(i18n.M.GoalBudgetExtended)
-	}
 	if c.executor != nil {
+		if spentBudget {
+			c.executor.ResetTaskBudget()
+		}
 		c.executor.RestoreDeliveryCheckpoint(c.goals.deliveryState())
 	}
 	return true
 }
 
 // PauseGoal suspends a running Goal without losing its todo list, Delivery
-// checkpoint, or budget history; ResumeGoal restores it. Returns false when no
+// checkpoint, or runtime history; ResumeGoal restores it. Returns false when no
 // running Goal exists.
 func (c *Controller) PauseGoal() bool {
 	if !c.goals.active() {
@@ -2765,7 +2826,7 @@ func (c *Controller) PauseGoal() bool {
 	return true
 }
 
-// GoalRuntime returns the active Goal's budget/runtime summary for frontends.
+// GoalRuntime returns the active Goal's usage/runtime summary for frontends.
 func (c *Controller) GoalRuntime() GoalRuntimeView {
 	return c.goals.runtimeView()
 }
@@ -2888,23 +2949,30 @@ func (c *Controller) NewSession() error {
 	}
 	c.hooks.SessionEnd(context.Background(), "clear")
 	c.extensionSessionEvent(extension.PointSessionEnd, dispatch.PhaseEnd, oldPath)
+	freshPath := oldPath
+	if c.sessionDir != "" {
+		freshPath = agent.NewSessionPath(c.sessionDir, c.label)
+	}
+	freshSession := agent.NewSession(c.systemPrompt)
+	if freshPath != oldPath {
+		if err := c.prepareSessionTransition(freshPath, "new", freshSession); err != nil {
+			return fmt.Errorf("bind new session: %w", err)
+		}
+	}
 	// Hold snapshotMu across the swap so an in-flight save cannot pair the old
 	// path with the fresh session (or the fresh path with the old session).
 	c.snapshotMu.Lock()
-	if c.sessionDir != "" {
-		c.mu.Lock()
-		c.sessionPath = agent.NewSessionPath(c.sessionDir, c.label)
-		c.guardianPath = guardian.PathFor(c.sessionPath)
-		c.mu.Unlock()
-	}
+	c.mu.Lock()
+	c.sessionPath = freshPath
+	c.guardianPath = guardian.PathFor(freshPath)
+	c.mu.Unlock()
 	c.setActiveJobSession(c.SessionPath())
-	c.executor.SetSession(agent.NewSession(c.systemPrompt))
+	c.executor.SetSession(freshSession)
 	c.bindExecutorProjection(c.SessionPath(), false)
 	if c.guardianSess != nil {
 		c.guardianSess.Reset()
 	}
 	c.ResetPlannerSession()
-	freshPath := c.SessionPath()
 	c.rebindCheckpoints(freshPath)
 	c.resetRecoveryForNewSession(freshPath)
 	c.rotateSessionTemp()
@@ -2924,6 +2992,7 @@ func (c *Controller) NewSession() error {
 	c.hooks.SetSessionID(c.parentSessionID())
 	c.enqueueHookContexts(c.hooks.SessionStart(context.Background(), "clear"))
 	c.extensionSessionEvent(extension.PointSessionStart, dispatch.PhaseStart, c.SessionPath())
+	c.clearSessionWriteAccess()
 	return nil
 }
 
@@ -2977,22 +3046,33 @@ func (c *Controller) ClearSession() error {
 		}
 		destroy.Finish()
 	}
+	freshPath := oldPath
+	if c.sessionDir != "" {
+		freshPath = agent.NewSessionPath(c.sessionDir, c.label)
+	}
+	freshSession := agent.NewSession(c.systemPrompt)
+	if freshPath != oldPath {
+		if err := c.prepareSessionTransition(freshPath, "clear", freshSession); err != nil {
+			if destroy.Async {
+				destroy.Finish()
+			}
+			c.snapshotMu.Unlock()
+			return fmt.Errorf("bind cleared session: %w", err)
+		}
+	}
 	c.hooks.SessionEnd(context.Background(), "clear")
 	c.extensionSessionEvent(extension.PointSessionEnd, dispatch.PhaseEnd, oldPath)
-	if c.sessionDir != "" {
-		c.mu.Lock()
-		c.sessionPath = agent.NewSessionPath(c.sessionDir, c.label)
-		c.guardianPath = guardian.PathFor(c.sessionPath)
-		c.mu.Unlock()
-	}
+	c.mu.Lock()
+	c.sessionPath = freshPath
+	c.guardianPath = guardian.PathFor(freshPath)
+	c.mu.Unlock()
 	c.setActiveJobSession(c.SessionPath())
-	c.executor.SetSession(agent.NewSession(c.systemPrompt))
+	c.executor.SetSession(freshSession)
 	c.bindExecutorProjection(c.SessionPath(), false)
 	if c.guardianSess != nil {
 		c.guardianSess.Reset()
 	}
 	c.ResetPlannerSession()
-	freshPath := c.SessionPath()
 	c.rebindCheckpoints(freshPath)
 	c.resetRecoveryForNewSession(freshPath)
 	c.rotateSessionTemp()
@@ -3006,6 +3086,7 @@ func (c *Controller) ClearSession() error {
 	c.hooks.SetSessionID(c.parentSessionID())
 	c.enqueueHookContexts(c.hooks.SessionStart(context.Background(), "clear"))
 	c.extensionSessionEvent(extension.PointSessionStart, dispatch.PhaseStart, c.SessionPath())
+	c.clearSessionWriteAccess()
 	if destroy.Async {
 		go func() {
 			result := destroy.Wait()
@@ -3151,15 +3232,6 @@ func (c *Controller) ForkSession(turn int, name string) (string, error) {
 }
 
 func (c *Controller) forkNamed(turn int, name string, switchToFork bool) (string, error) {
-	if c.executor == nil {
-		return "", c.rewindFail(fmt.Errorf("checkpoints unavailable"))
-	}
-	if c.sessionDir == "" {
-		return "", c.rewindFail(fmt.Errorf("fork needs session persistence, which is disabled"))
-	}
-	// Hold the rotation gate from before the pre-fork Snapshot through the
-	// switch below: a bare Running() check released here would let a turn start
-	// during the snapshot and then be switched onto the fork.
 	if err := c.beginRotation(); err != nil {
 		if errors.Is(err, errTurnRunningRotation) {
 			return "", c.rewindFail(fmt.Errorf("cannot fork while a turn is running"))
@@ -3167,6 +3239,16 @@ func (c *Controller) forkNamed(turn int, name string, switchToFork bool) (string
 		return "", c.rewindFail(err)
 	}
 	defer c.endRotation()
+	return c.forkNamedReady(turn, name, switchToFork)
+}
+
+func (c *Controller) forkNamedReady(turn int, name string, switchToFork bool) (string, error) {
+	if c.executor == nil {
+		return "", c.rewindFail(fmt.Errorf("checkpoints unavailable"))
+	}
+	if c.sessionDir == "" {
+		return "", c.rewindFail(fmt.Errorf("fork needs session persistence, which is disabled"))
+	}
 	boundary, hasBound := c.checkpoints.boundary(turn)
 	if !hasBound {
 		return "", c.rewindFail(fmt.Errorf("fork unavailable for turn %d (resumed session)", turn))
@@ -3204,6 +3286,9 @@ func (c *Controller) forkNamed(turn int, name string, switchToFork bool) (string
 		return "", c.rewindFail(err)
 	}
 	if switchToFork {
+		if err := c.prepareSessionTransition(newPath, "fork", sess); err != nil {
+			return "", c.rewindFail(fmt.Errorf("bind fork session: %w", err))
+		}
 		// See snapshotMu: the swap must not interleave with an in-flight save.
 		c.snapshotMu.Lock()
 		c.executor.SetSession(sess)
@@ -3291,6 +3376,9 @@ func (c *Controller) Branch(name string) (string, error) {
 	}); err != nil {
 		return "", c.rewindFail(err)
 	}
+	if err := c.prepareSessionTransition(newPath, "branch", sess); err != nil {
+		return "", c.rewindFail(fmt.Errorf("bind branch session: %w", err))
+	}
 	// See snapshotMu: the swap must not interleave with an in-flight save.
 	c.snapshotMu.Lock()
 	c.executor.SetSession(sess)
@@ -3352,6 +3440,9 @@ func (c *Controller) SwitchBranch(ref string) (agent.BranchInfo, error) {
 	loaded, err := agent.LoadSession(match.Path)
 	if err != nil {
 		return agent.BranchInfo{}, c.rewindFail(err)
+	}
+	if err := c.prepareSessionTransition(match.Path, "switch", loaded); err != nil {
+		return agent.BranchInfo{}, c.rewindFail(fmt.Errorf("bind switched session: %w", err))
 	}
 	// See snapshotMu: the swap must not interleave with an in-flight save.
 	c.snapshotMu.Lock()
@@ -3690,26 +3781,26 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 	if strategyErr != nil {
 		return false, strategyErr
 	}
-	forceRewrite = forceRewrite || s.NeedsRewriteSave()
-	var err error
-	if forceRewrite {
-		err = s.SaveRewrite(path)
-	} else {
-		err = s.SaveSnapshot(path)
-		if errors.Is(err, agent.ErrSessionSnapshotConflict) {
-			// The no-rewrite decision may already be stale: auto-compaction
-			// can rewrite history between the decision and the write. Re-check
-			// and retry once as an owned rewrite before treating the failure as
-			// a real cross-runtime conflict.
-			if s.NeedsRewriteSave() {
-				forceRewrite = true
-				err = s.SaveRewrite(path)
-			}
-		}
+	err, forceRewrite := persistSessionSnapshot(s, path, forceRewrite)
+	if authoritySaveError(err) {
+		// Missing/stale authority must not enter diverged/recovery. Frontends
+		// rebind the lease or surface the typed error.
+		return false, err
 	}
 	if err != nil {
 		if shutdownRecovery && errors.Is(err, agent.ErrSessionFileLockHeld) {
 			recoveredPath, recoverErr := c.recoverShutdownSnapshot(path, err)
+			if recoverErr != nil {
+				return false, recoverErr
+			}
+			path = recoveredPath
+			s = c.executor.Session()
+			err = nil
+		}
+	}
+	if err != nil {
+		if errors.Is(err, agent.ErrSessionExternallyRemoved) {
+			recoveredPath, recoverErr := c.recoverExternallyRemovedSession(path, err)
 			if recoverErr != nil {
 				return false, recoverErr
 			}
@@ -3772,6 +3863,35 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 	return transcriptDurable, nil
 }
 
+func (c *Controller) recoverExternallyRemovedSession(path string, saveErr error) (string, error) {
+	if c.executor == nil || strings.TrimSpace(path) == "" {
+		return "", saveErr
+	}
+	const reason = "session removed while open"
+	req := SessionRecoveryRequest{OriginalPath: path, Reason: reason, Mode: "external-removal"}
+	meta := agent.BranchMeta{}
+	if c.sessionRecoveryMeta != nil {
+		meta = c.sessionRecoveryMeta(req)
+	}
+	info, err := c.executor.Session().SaveConflictRecoveryBranch(agent.RecoveryBranchOptions{
+		OriginalPath: path,
+		Reason:       reason,
+		BranchMeta:   meta,
+	})
+	if err != nil {
+		return "", fmt.Errorf("preserve externally removed session: %w", err)
+	}
+	if err := c.commitRecoveredSession(path, reason, info); err != nil {
+		return "", err
+	}
+	appendSnapshotConflictDiagnostic(path, "external-removal", "moved_to_stable_recovery", saveErr, info.Path, info.Existing)
+	slog.Warn("controller: active session was removed externally; moved runtime to stable recovery path",
+		"path", path, "recovery", info.Path, "existing", info.Existing)
+	c.sink.Emit(sessionRecoveryNotice(event.NoticeCodeSessionRecoveryForked,
+		"the open session file was removed outside Reasonix; your active conversation was preserved as one recovery copy"))
+	return info.Path, nil
+}
+
 // snapshotConflictLogAttrs flattens a snapshot-conflict error into slog attrs.
 // Field reports of #6069-class "session changed on disk" spam are only
 // diagnosable when the logs say which trigger fired and what the revision
@@ -3789,59 +3909,6 @@ func snapshotConflictLogAttrs(saveErr error, path, mode string) []any {
 		)
 	}
 	return attrs
-}
-
-type snapshotConflictDiagnostic struct {
-	At               time.Time `json:"at"`
-	BranchID         string    `json:"branch_id"`
-	Mode             string    `json:"mode"`
-	Outcome          string    `json:"outcome"`
-	Kind             string    `json:"kind,omitempty"`
-	DiskMessages     int       `json:"disk_messages,omitempty"`
-	SnapshotMessages int       `json:"snapshot_messages,omitempty"`
-	BaseRevision     int64     `json:"base_revision,omitempty"`
-	DiskRevision     int64     `json:"disk_revision,omitempty"`
-	RecoveryBranchID string    `json:"recovery_branch_id,omitempty"`
-	ExistingRecovery bool      `json:"existing_recovery,omitempty"`
-}
-
-func appendSnapshotConflictDiagnostic(path, mode, outcome string, saveErr error, recoveryPath string, existing bool) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return
-	}
-	rec := snapshotConflictDiagnostic{
-		At:       time.Now(),
-		BranchID: agent.BranchID(path),
-		Mode:     mode,
-		Outcome:  outcome,
-	}
-	var conflict *agent.SessionSnapshotConflictError
-	if errors.As(saveErr, &conflict) && conflict != nil {
-		rec.Kind = string(conflict.Kind)
-		rec.DiskMessages = conflict.ExistingMessages
-		rec.SnapshotMessages = conflict.SnapshotMessages
-		rec.BaseRevision = conflict.BaseRevision
-		rec.DiskRevision = conflict.DiskRevision
-	}
-	if recoveryPath != "" {
-		rec.RecoveryBranchID = agent.BranchID(recoveryPath)
-		rec.ExistingRecovery = existing
-	}
-	data, err := json.Marshal(rec)
-	if err != nil {
-		return
-	}
-	logPath := store.SessionConflictLog(path)
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return
-	}
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.Write(append(data, '\n'))
 }
 
 // conflictOutcome is recoverSnapshotConflict's declared result. Callers act
@@ -3862,8 +3929,6 @@ const (
 	conflictForkedBranch
 )
 
-const recoveryDepthCapNoticeText = "repeated save conflicts were detected; saved the current conflict copy in an isolated recovery branch"
-
 func sessionRecoveryNotice(code, text string) event.Event {
 	return event.Event{
 		Kind:     event.Notice,
@@ -3872,21 +3937,6 @@ func sessionRecoveryNotice(code, text string) event.Event {
 		Code:     code,
 		Text:     text,
 	}
-}
-
-func (c *Controller) emitRecoveryDepthCapNotice(path string) {
-	key := filepath.Clean(strings.TrimSpace(path))
-	c.mu.Lock()
-	if c.recoveryDepthCapNotices == nil {
-		c.recoveryDepthCapNotices = make(map[string]bool)
-	}
-	if c.recoveryDepthCapNotices[key] {
-		c.mu.Unlock()
-		return
-	}
-	c.recoveryDepthCapNotices[key] = true
-	c.mu.Unlock()
-	c.sink.Emit(sessionRecoveryNotice(event.NoticeCodeSessionRecoveryDepthCap, recoveryDepthCapNoticeText))
 }
 
 func (c *Controller) recoverSnapshotConflict(path string, saveErr error, forceRewrite bool) (string, conflictOutcome, error) {
@@ -3922,27 +3972,6 @@ func (c *Controller) recoverSnapshotConflict(path string, saveErr error, forceRe
 		BranchMeta:   meta,
 	})
 	if err != nil {
-		if errors.Is(err, agent.ErrSessionRecoveryDepthExceeded) {
-			// The canonical branch may have advanced since this runtime loaded it.
-			// Never force-write the stale in-memory snapshot back onto that path just
-			// to stop a recovery chain. Preserve it in a writer-specific isolated
-			// branch instead; the depth cap limits lineage fan-out, not data safety.
-			isolated, isolatedErr := c.executor.Session().SaveConflictRecoveryBranch(agent.RecoveryBranchOptions{
-				OriginalPath: path,
-				Reason:       reason,
-				BranchMeta:   meta,
-			})
-			if isolatedErr != nil {
-				return "", conflictDropped, fmt.Errorf("recovery chain depth exceeded; isolated copy failed: %w", isolatedErr)
-			}
-			if err := c.commitRecoveredSession(path, reason, isolated); err != nil {
-				return "", conflictDropped, err
-			}
-			appendSnapshotConflictDiagnostic(path, mode, "recovery_depth_cap_isolated", saveErr, isolated.Path, isolated.Existing)
-			slog.Warn("controller: snapshot conflict; recovery depth cap reached, isolated stale transcript", append(logAttrs, "recovery", isolated.Path)...)
-			c.emitRecoveryDepthCapNotice(path)
-			return isolated.Path, conflictForkedBranch, nil
-		}
 		if errors.Is(err, agent.ErrSessionRecoveryNotNeeded) {
 			if c.adoptDiskSession(path) {
 				appendSnapshotConflictDiagnostic(path, mode, "recovery_not_needed_adopted_disk_transcript", saveErr, "", false)
@@ -4017,9 +4046,9 @@ func (c *Controller) commitRecoveredSession(originalPath, reason string, info ag
 	c.sessionPath = info.Path
 	c.guardianPath = guardian.PathFor(info.Path)
 	c.mu.Unlock()
-	// Recovery branch is a new lineage path; do not keep writing the original
-	// session's projection sidecar.
-	c.bindExecutorProjection(info.Path, false)
+	// Recovery branch is a new lineage path. Load an inherited projection
+	// sidecar when present so the model view stays compressed across the fork.
+	c.bindExecutorProjection(info.Path, true)
 	c.setActiveJobSession(info.Path)
 	c.rebindCheckpoints(info.Path)
 	c.transplantInFlightTurnMarker(originalPath, info.Path)
@@ -4788,51 +4817,6 @@ func (c *Controller) Todos() []evidence.TodoItem {
 	return c.executor.CanonicalTodoState()
 }
 
-// ToolResultData holds the full arguments and output for one tool call, loaded
-// on demand when a frontend expands a collapsed tool card.
-type ToolResultData struct {
-	Args      string                  `json:"args"`
-	Output    string                  `json:"output"`
-	Execution *provider.ToolExecution `json:"execution,omitempty"`
-}
-
-// ToolResult looks up a tool call by its ID in the session history and returns
-// the full arguments + output that were elided from the frontend's items[].
-// Returns nil when the tool ID isn't found (e.g. a sub-agent's tool call that
-// lives in a different session).
-func (c *Controller) ToolResult(toolID string) *ToolResultData {
-	if c.executor == nil {
-		return nil
-	}
-	msgs := c.executor.Session().Snapshot()
-	// Search backwards: tool result first (most recent), then find the args
-	// from the preceding assistant turn.
-	for i, msg := range slices.Backward(msgs) {
-		if msg.Role != provider.RoleTool || msg.ToolCallID != toolID {
-			continue
-		}
-		out := &ToolResultData{
-			Args:      "",
-			Output:    msg.Content,
-			Execution: msg.ToolExecution,
-		}
-		// Walk back to find the assistant turn that issued this call.
-		for j := i; j >= 0; j-- {
-			if msgs[j].Role != provider.RoleAssistant {
-				continue
-			}
-			for _, tc := range msgs[j].ToolCalls {
-				if tc.ID == toolID {
-					out.Args = tc.Arguments
-					return out
-				}
-			}
-		}
-		return out
-	}
-	return nil
-}
-
 // Balance queries the active provider's wallet balance, or (nil, nil) when the
 // provider declares no balance_url — so a caller treats "not configured" and
 // "fetched" the same and just omits the readout when nil.
@@ -5396,7 +5380,14 @@ func (c *Controller) InheritLifecycleFrom(prev *Controller) {
 // for carrying into a replacement controller across a rebuild — see
 // RestoreSessionAuthorizations.
 func (c *Controller) SessionAuthorizations() SessionAuthorizations {
-	return c.approval.snapshotSessionAuthorizations()
+	auth := c.approval.snapshotSessionAuthorizations()
+	if c.writeAccess.roots != nil {
+		auth.WriteRoots = c.writeAccess.roots.SessionRoots()
+		if auth.WriteRoots == nil {
+			auth.WriteRoots = []string{}
+		}
+	}
+	return auth
 }
 
 // RestoreSessionAuthorizations re-applies session authorizations captured
@@ -5405,6 +5396,9 @@ func (c *Controller) SessionAuthorizations() SessionAuthorizations {
 // replacement forgets every grant the user already made this session.
 func (c *Controller) RestoreSessionAuthorizations(auth SessionAuthorizations) {
 	c.approval.restoreSessionAuthorizations(auth)
+	if c.writeAccess.roots != nil && len(auth.WriteRoots) > 0 {
+		c.writeAccess.roots.GrantVerifiedSession(auth.WriteRoots)
+	}
 }
 
 // ReleaseResources stops plugin subprocesses and releases resources without
@@ -5455,6 +5449,7 @@ func (c *Controller) close(fireSessionEnd bool, jobsMode closeJobsMode) {
 		// foreground goroutine actually exits; clearing it here would report idle
 		// while tools and prompt waiters were still live.
 		c.finishing = false
+		c.finishingBoundary.end()
 		if cancel != nil {
 			c.canceling = true
 		}
@@ -5553,11 +5548,9 @@ func (c *Controller) SetToolApprovalMode(mode string) {
 }
 
 // ApplyToolApprovalMode is SetToolApprovalMode reporting which pending
-// approval prompt ids the new posture auto-allowed. Prompts NOT in the
-// returned set are still pending here — fresh user decisions (plan, memory,
-// sandbox escape) never drain, and auto keeps approvals an allow policy would
-// not cover — so a frontend must keep showing them instead of assuming the
-// posture switch resolved everything (#6432).
+// approval prompt ids the new posture auto-allowed. Plan, sandbox escape,
+// and config writes never drain; Auto keeps explicit memory asks but drains
+// fallback ones; YOLO drains both. Frontends must keep the rest (#6432).
 func (c *Controller) ApplyToolApprovalMode(mode string) []string {
 	mode = normalizeToolApprovalMode(mode)
 	// Capture mode-change recovery dismissals before approval drain so a
@@ -6126,12 +6119,9 @@ func (c *Controller) requestApprovalDecisionWithOptions(ctx context.Context, too
 	// runs synchronously and before the dialog is shown. Native Reasonix
 	// PermissionRequest hooks stay advisory-only (see claudePermissionBlocking).
 	//
-	// A hook's auto-allow must never stand in for a human-required decision:
-	// sandbox escapes, Reasonix config writes, memory remember/forget, and
-	// plan approval (RequiresFreshHumanApprovalTool) are deliberately excluded
-	// from YOLO/auto-approval and Guardian too, so a broadly-matched plugin
-	// hook returning "allow" can't silently rubber-stamp them. A deny still
-	// applies universally — refusing is always safe to honor automatically.
+	// Hook auto-allow cannot replace a fresh-human decision. Interactive
+	// YOLO may already have skipped remember/forget via preApproved. Deny
+	// still applies universally — refusing is always safe to honor.
 	if hookSubject, hookArgs, ok := permissionRequestHookPayload(tool, subject, args); ok {
 		if decision, _ := c.hooks.PermissionRequest(ctx, tool, hookSubject, hookArgs); decision != nil {
 			switch {

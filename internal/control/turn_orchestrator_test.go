@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"reasonix/internal/agent"
-	"reasonix/internal/capability"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/hook"
@@ -57,9 +56,8 @@ func TestTurnOrchestratorAttachesTrustedPlannerMetadata(t *testing.T) {
 	exec := agent.New(nil, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
 	runner := &plannerMetadataRunner{}
 	c := New(Options{
-		Runner:         runner,
-		Executor:       exec,
-		RuntimeProfile: capability.ProfileDelivery,
+		Runner:   runner,
+		Executor: exec,
 	})
 	c.SetGoal("migrate authentication across the backend")
 
@@ -72,7 +70,7 @@ func TestTurnOrchestratorAttachesTrustedPlannerMetadata(t *testing.T) {
 	if runner.meta.UserText != raw {
 		t.Fatalf("planner metadata user text = %q, want pristine %q", runner.meta.UserText, raw)
 	}
-	if runner.meta.ExplicitPlanMode || !runner.meta.GoalActive || !runner.meta.DeliveryProfile {
+	if runner.meta.ExplicitPlanMode || !runner.meta.GoalActive || !runner.meta.ClosedLoop || !runner.meta.PolicySet || !runner.meta.Policy.ClosedLoop() {
 		t.Fatalf("planner metadata missing trusted host state: %+v", runner.meta)
 	}
 	if !runner.meta.HasConversationContext {
@@ -333,43 +331,50 @@ type recordingSessionRunner struct {
 }
 
 type deliveryScopeErrorRunner struct {
-	scopes []agent.DeliveryExecutionScope
+	scopes        []agent.DeliveryExecutionScope
+	terminalAfter int
+	// usage stands in for the billable work a real executor would report; the
+	// goal's spend budget is measured in it.
+	usage event.Sink
 }
 
 func (r *deliveryScopeErrorRunner) Run(ctx context.Context, _ string) error {
 	if scope, ok := agent.DeliveryExecutionScopeFromContext(ctx); ok {
 		r.scopes = append(r.scopes, scope)
 	}
+	if r.usage != nil {
+		r.usage.Emit(event.Event{Kind: event.Usage, UsageSource: event.UsageSourceExecutor,
+			Usage: &provider.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110, RequestCount: 1}})
+	}
+	if r.terminalAfter > 0 && len(r.scopes) >= r.terminalAfter {
+		return errors.New("external provider stop")
+	}
 	return &agent.FinalReadinessError{Attempts: 1, Reason: "missing verification", Missing: []string{"verification"}}
 }
 
-func TestGoalReadinessFailureContinuesThenPausesOnTurnBudget(t *testing.T) {
-	runner := &deliveryScopeErrorRunner{}
+func TestGoalReadinessFailureContinuesUntilExternalStop(t *testing.T) {
+	runner := &deliveryScopeErrorRunner{terminalAfter: 3}
 	executor := agent.New(nil, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
 	c := New(Options{Runner: runner, Executor: executor})
 	c.SetGoal("ship the integration")
 
 	err := newTurnOrchestrator(c).runGoalLoopWithRawDisplay(context.Background(), "start", "start", "")
-	if err != nil {
-		t.Fatalf("run err = %v, want the loop to absorb FinalReadinessError and pause on the turn budget", err)
+	if err == nil || err.Error() != "external provider stop" {
+		t.Fatalf("run err = %v, want external provider stop after continuations", err)
 	}
-	// The FSM absorbs the readiness failure and continues with the missing
-	// requirements; cross-turn no-progress remains observational and the outer
-	// continuation backstop eventually pauses the goal.
-	if got := c.GoalStatus(); got != GoalStatusBlocked {
-		t.Fatalf("GoalStatus = %q, want blocked (turn-budget pause)", got)
+	// The FSM absorbs readiness failures and keeps the Goal running; only the
+	// external provider error ends this execution attempt.
+	if got := c.GoalStatus(); got != GoalStatusRunning {
+		t.Fatalf("GoalStatus = %q, want running", got)
 	}
-	if rt := c.GoalRuntime(); rt.StopCause != stopCauseBudgetTurns {
-		t.Fatalf("stop cause = %q, want %q", rt.StopCause, stopCauseBudgetTurns)
+	if rt := c.GoalRuntime(); rt.StopCause != "" || rt.TurnsUsed != 2 {
+		t.Fatalf("runtime = %+v, want two completed continuations and no pause", rt)
 	}
 	if len(runner.scopes) < 2 || runner.scopes[0].ID == "" || runner.scopes[0].TaskText != "ship the integration" {
 		t.Fatalf("delivery scopes = %+v, want scoped continuation turns", runner.scopes)
 	}
-	if !c.ResumeGoal() || c.GoalStatus() != GoalStatusRunning {
-		t.Fatal("paused Goal should resume with its existing scope")
-	}
 	if id, task, ok := c.goals.deliveryScope(); !ok || id != runner.scopes[0].ID || task != "ship the integration" {
-		t.Fatalf("resumed scope = (%q, %q, %v), want preserved id/task", id, task, ok)
+		t.Fatalf("preserved scope = (%q, %q, %v), want original id/task", id, task, ok)
 	}
 }
 
@@ -476,11 +481,11 @@ func TestTurnOrchestratorGoalContinuationRunsStopPerUnit(t *testing.T) {
 }
 
 func TestTurnOrchestratorApprovedPlanSharesOneStopHook(t *testing.T) {
-	prov := &scriptedTurns{turns: [][]provider.Chunk{
-		textTurn("Plan:\n1. Make the change\n2. Verify it"),
-		textTurn("Done."),
-	}}
-	ag := agent.New(prov, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
+	prov := &scriptedTurns{turns: planThenExecuteTurns(
+		"Plan:\n1. Make the change\n2. Verify it",
+		"Done.",
+	)}
+	ag := newPlanTestAgent(prov)
 	approvalID := make(chan string, 1)
 	var promptSubmitEvents, stopEvents int
 	hooks := hook.NewRunner([]hook.ResolvedHook{
@@ -525,8 +530,8 @@ func TestTurnOrchestratorApprovedPlanSharesOneStopHook(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if prov.call != 2 {
-		t.Fatalf("provider calls = %d, want plan + approved execution", prov.call)
+	if prov.call != 3 {
+		t.Fatalf("provider calls = %d, want plan + read + answer", prov.call)
 	}
 	if promptSubmitEvents != 1 {
 		t.Fatalf("UserPromptSubmit events = %d, want one for plan + approved execution unit", promptSubmitEvents)
@@ -692,8 +697,8 @@ func TestTurnOrchestratorCheckpointBoundaryPrecedesUserMessage(t *testing.T) {
 	if err := c.Rewind(0, RewindConversation); err != nil {
 		t.Fatal(err)
 	}
-	if len(sess.Messages) != 1 {
-		t.Fatalf("session messages after rewind = %d, want boundary before user message", len(sess.Messages))
+	if live := exec.Session(); len(sess.Messages) != 2 || live == nil || len(live.Messages) != 1 || c.SessionPath() == path {
+		t.Fatalf("parent unchanged / fork switch failed")
 	}
 }
 

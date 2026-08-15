@@ -139,6 +139,11 @@ input,textarea{font:inherit;color:inherit}
 
 .notice{max-width:760px;margin:5px auto;font-size:13px;color:var(--fg-2);padding:5px 12px;border-left:2px solid var(--border);border-radius:0 var(--radius) var(--radius) 0;white-space:pre-wrap}
 .notice--warn{color:var(--warning);border-left-color:var(--warning);background:var(--warning-soft)}
+.readiness-card{max-width:760px;margin:8px auto;padding:12px 14px;border:1px solid var(--accent);border-radius:var(--radius-lg);background:var(--panel);color:var(--fg-2)}
+.readiness-card__title{font-weight:650;color:var(--fg);margin-bottom:5px}
+.readiness-card__detail{font-size:12px;color:var(--muted);margin-top:5px}
+.readiness-card__action{margin-top:9px;padding:6px 11px;border:1px solid var(--accent);border-radius:var(--radius);background:var(--accent-soft);color:var(--accent);cursor:pointer}
+.readiness-card__action:disabled{opacity:.55;cursor:not-allowed}
 .phase{max-width:760px;margin:10px auto;text-align:center;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted-2);font-family:var(--mono)}
 .compaction{max-width:760px;margin:8px auto;border:1px dashed var(--border);border-radius:var(--radius);padding:8px 12px;font-size:13px;color:var(--fg-2);background:var(--bg-2)}
 .compaction__head{display:flex;align-items:center;gap:7px;cursor:pointer}
@@ -616,11 +621,17 @@ const __T = {
     'loading': 'Loading...',
     'cache': 'Cache',
     'cost': 'Cost',
+    'multi_currency': 'Multiple currencies',
     'balance': 'Balance',
     'ready': 'Ready',
     'thinking': 'Thinking...',
     'retrying_status': 'Retrying ({attempt}/{max})...',
     'recovery_paused': 'Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send “Continue” to start a fresh attempt, or add instructions to change direction.',
+    'final_readiness_title': 'Task completion checks are not complete',
+    'final_readiness_body': 'The response was generated, but this task still requires verification or review.',
+    'final_readiness_missing': 'Still needed: ',
+    'final_readiness_continue': 'Continue checks',
+    'final_readiness_prompt': 'Continue and complete the remaining task checks.',
     'stats': 'Stats',
     'statistics': 'Statistics',
     'model': 'Model',
@@ -761,11 +772,17 @@ const __T = {
     'loading': '加载中...',
     'cache': '缓存',
     'cost': '费用',
+    'multi_currency': '多币种',
     'balance': '余额',
     'ready': '就绪',
     'thinking': '思考中...',
     'retrying_status': '正在重试 ({attempt}/{max})...',
     'recovery_paused': '已暂停自动重试。Reasonix 已停止重复尝试，并保留已完成的工作。发送“继续”即可开始新一轮，也可以补充要求来调整方向。',
+    'final_readiness_title': '任务收尾检查尚未完成',
+    'final_readiness_body': '内容已经生成，但这项任务要求的验证或复审步骤尚未完成。',
+    'final_readiness_missing': '仍需完成：',
+    'final_readiness_continue': '继续检查',
+    'final_readiness_prompt': '继续完成剩余的任务收尾检查。',
     'stats': '统计',
     'statistics': '统计',
     'model': '模型',
@@ -1025,7 +1042,17 @@ function isTextEntry(t) { return !!t&&(t.tagName==='INPUT'||t.tagName==='TEXTARE
 function isPlainKey(e) { return !e.ctrlKey&&!e.metaKey&&!e.altKey&&!isTextEntry(e.target); }
 function fmtTok(n) { return n>=1000?(n/1000).toFixed(1).replace(/\.0$/,'')+'k':String(n);}
 function currencySymbol(c){const v=String(c||'¥').trim();if(/^(cny|rmb|yuan)$/i.test(v))return '¥';if(/^(usd|dollar)$/i.test(v))return '$';return v||'¥';}
-function fmtMoney(n,c){if(typeof n!=='number'||!isFinite(n))return '—';const s=currencySymbol(c);return s+(n<1?n.toFixed(4):n.toFixed(2));}
+function fmtMoney(n,c){if(typeof n!=='number'||!isFinite(n)||n<=0)return '—';const s=currencySymbol(c);return '≈'+s+(n<1?n.toFixed(4):n.toFixed(2));}
+function usageSelectedCost(u){
+  if(!u)return null;
+  if(u.costQuote&&(u.costQuote.displayStatus==='bucketed'||u.costQuote.aggregateMode==='currency_buckets'))return{bucketed:true,complete:false};
+  const sel=u.costQuote&&u.costQuote.selected;
+  if(sel&&sel.amount){const n=Number(sel.amount);if(Number.isFinite(n)&&n>0)return{amount:n,currency:sel.currency||u.currencyCode||u.currency,complete:u.costQuote.displayComplete!==false,displayStatus:u.costQuote.displayStatus};}
+  if(u.costQuote)return null;
+  const n=u.cost??u.costUsd;
+  if(typeof n==='number'&&n>0)return{amount:n,currency:u.currencyCode||u.currency,complete:u.costQuote?u.costQuote.complete!==false:true};
+  return null;
+}
 function fmtElapsed(ms) { const s=Math.floor(ms/1000); return s<60?s+'s':Math.floor(s/60)+'m '+s%60+'s';}
 function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function escAttr(s) { return escHtml(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
@@ -1052,6 +1079,26 @@ function showNotice(text, tone) {
   const n=el('div','notice'+(tone==='warn'?' notice--warn':''),text);
   log.appendChild(n);
   scrollDown(true); // synchronous feedback to a user action — always reveal
+}
+function showFinalReadinessPause(readiness){
+  hideWelcome();
+  const card=el('div','readiness-card');
+  card.appendChild(el('div','readiness-card__title',__('final_readiness_title')));
+  card.appendChild(el('div','',__('final_readiness_body')));
+  const missing=Array.isArray(readiness?.missing)?readiness.missing.filter(Boolean):[];
+  if(missing.length)card.appendChild(el('div','readiness-card__detail',__('final_readiness_missing')+missing.join(', ')));
+  const button=el('button','readiness-card__action',__('final_readiness_continue'));
+  button.type='button';
+  button.onclick=async()=>{
+    button.disabled=true;
+    const prompt=__('final_readiness_prompt');
+    addUserMsg(prompt);
+    const response=await post('/submit',{input:prompt,action:'final_readiness_recovery'});
+    if(response.ok){card.remove();return;}
+    button.disabled=false;
+    showNotice((await response.text()).trim()||'Recovery was not accepted.','warn');
+  };
+  card.appendChild(button);log.appendChild(card);scrollDown(true);
 }
 function updateActionAvailability() {
   setActionDisabled('btn-compact', running || !hasVisibleHistory, running ? __('thinking') : __('no_conversation'));
@@ -1554,8 +1601,7 @@ es.onmessage=ev=>{setConnState('connected');
     case 'usage':
       if(e.usage){turnTokens=e.usage.completionTokens||0;
         cumulativeTokens+=e.usage.totalTokens||0;
-        const usageCost=e.usage.cost??e.usage.costUsd;
-        if(typeof usageCost==='number')cumulativeCost+=usageCost;
+        const picked=usageSelectedCost(e.usage);
         cumulativeCacheHit+=e.usage.cacheHitTokens||0;
         cumulativeCacheMiss+=e.usage.cacheMissTokens||0;
         const strip=el('div','metric-strip');
@@ -1563,7 +1609,8 @@ es.onmessage=ev=>{setConnState('connected');
           const sp=el('span','item');sp.innerHTML=it.l+' <span class="v '+it.c+'">'+it.v+'</span>';strip.appendChild(sp);
         });
         if(e.usage.cacheHitTokens){const sp=el('span','item');sp.innerHTML=__('cache')+' <span class="v acc">'+Math.round(e.usage.cacheHitTokens/Math.max(1,e.usage.cacheHitTokens+e.usage.cacheMissTokens)*100)+'%</span>';strip.appendChild(sp);}
-        if(typeof usageCost==='number'&&usageCost>0){const sp=el('span','item');sp.innerHTML=__('cost')+' <span class="v">'+fmtMoney(usageCost,e.usage.currency)+'</span>';strip.appendChild(sp);}
+        if(picked&&picked.bucketed){const sp=el('span','item');sp.innerHTML=__('cost')+' <span class="v">'+__('multi_currency')+'</span>';strip.appendChild(sp);}
+        else if(picked&&picked.amount>0){const sp=el('span','item');sp.innerHTML=__('cost')+' <span class="v">'+fmtMoney(picked.amount,picked.currency||e.usage.currency)+'</span>';strip.appendChild(sp);}
         log.appendChild(strip);scrollDown();
       } break;
     case 'notice': log.appendChild(el('div','notice'+(e.level==='warn'?' notice--warn':''),(e.level==='warn'?'! ':'')+(e.text||'')));scrollDown();break;
@@ -1575,7 +1622,7 @@ es.onmessage=ev=>{setConnState('connected');
     case 'compaction_started': showCompaction({trigger:e.compaction?.trigger}); break;
     case 'compaction_done': showCompaction(e.compaction||{}); break;
     case 'retrying': setRetrying(e.retryAttempt,e.retryMax); break;
-    case 'turn_done': clearPendingPrompts(); finalizeMsg(); setRunning(false); if(e.outcome==='recovery_paused'){showNotice('⏸ '+__('recovery_paused'));}else if(e.err){log.appendChild(el('div','msg--error','✗ '+e.err));scrollDown();} fetchStatus(); fetchTodos(); refreshCheckpointAvailability(); break;
+    case 'turn_done': clearPendingPrompts(); finalizeMsg(); setRunning(false); if(e.outcome==='final_readiness'){showFinalReadinessPause(e.readiness);}else if(e.outcome==='recovery_paused'){showNotice('⏸ '+__('recovery_paused'));}else if(e.err){log.appendChild(el('div','msg--error','✗ '+e.err));scrollDown();} fetchStatus(); fetchTodos(); refreshCheckpointAvailability(); break;
   }
 };
 es.onerror=()=>{
@@ -1602,11 +1649,12 @@ function fetchStatus(){
     goalText=(s.goal||'').trim();
     goalActive=goalText!==''&&(s.goalStatus||'')==='running';
     updateGoalUI();
+    sessionCostQuote=s.sessionCostQuote||null;
     // sidebar metrics
     const cacheTotal=(s.cacheHit||0)+(s.cacheMiss||0);
     $('#sm-cache').textContent=cacheTotal>0?Math.round((s.cacheHit||0)/cacheTotal*100)+'%':'—';
-    const lastCost=s.lastUsage?.cost??s.lastUsage?.costUsd??s.lastUsage?.totalCost;
-    if(typeof lastCost==='number')$('#sm-cost').textContent=fmtMoney(lastCost,s.lastUsage?.currency);
+    const lastPicked=usageSelectedCost(s.lastUsage);
+    $('#sm-cost').textContent=lastPicked?.bucketed?__('multi_currency'):lastPicked?fmtMoney(lastPicked.amount,lastPicked.currency||s.lastUsage?.currency):'—';
     if(s.balance){$('#sm-balance').textContent=s.balance.display||'--';}
     if(s.balance)balanceInfo.textContent='💰 '+(s.balance.display||'--');
   }).catch(()=>{});
@@ -1620,6 +1668,7 @@ function renderHistoryMessages(ms){
     if(m.role==='user')return !!m.content;
     if(m.role==='assistant')return !!(m.content||m.reasoning||(m.toolCalls&&m.toolCalls.length));
     if(m.role==='tool')return !!(m.content||m.toolCallId||m.toolName);
+    if(m.role==='final_readiness')return true;
     return false;
   });
   hasVisibleHistory=visible;
@@ -1632,6 +1681,7 @@ function renderHistoryMessages(ms){
   ms.forEach(m=>{
     if(m.role==='system')return;
     if(m.role==='user'){if(m.content)addUserMsg(m.content);return;}
+    if(m.role==='final_readiness'){showFinalReadinessPause({missing:m.missing||[]});return;}
     if(m.role==='assistant'){
       if(m.reasoning)appendReasoning(m.reasoning);
       if(m.content)appendText(m.content);
@@ -1972,8 +2022,9 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&sidebar.classList.c
 // Session-scoped counters accumulated while this page is open. They reset on
 // session rotation (/new, /resume) so the stats card labeled "session cost"
 // never quietly turns into an all-sessions running total.
-let cumulativeTokens=0, cumulativeCost=0, cumulativeCacheHit=0, cumulativeCacheMiss=0;
-function resetCumulativeStats(){cumulativeTokens=0;cumulativeCost=0;cumulativeCacheHit=0;cumulativeCacheMiss=0;}
+let cumulativeTokens=0, cumulativeCacheHit=0, cumulativeCacheMiss=0;
+let sessionCostQuote=null;
+function resetCumulativeStats(){cumulativeTokens=0;cumulativeCacheHit=0;cumulativeCacheMiss=0;sessionCostQuote=null;}
 function openStats(){
   const modal=$('#stats-modal');
   if(!modal)return;
@@ -1986,10 +2037,11 @@ function openStats(){
     const hit=cumulativeCacheHit||s.cacheHit||0, miss=cumulativeCacheMiss||s.cacheMiss||0;
     const rate=hit+miss>0?Math.round(hit/(hit+miss)*100)+'%':'0%';
     $('#stats-cache-rate').textContent=rate;
-    // No single-request fallback here: rendering lastUsage.cost (one turn)
-    // under the session-cost label displayed one turn's spend as the session's.
-    const cost=cumulativeCost;
-    $('#stats-total-cost').textContent=cost>0?fmtMoney(cost,s.lastUsage?.currency):'-';
+    const quote=s.sessionCostQuote;
+    if(quote?.displayStatus==='bucketed'||quote?.aggregateMode==='currency_buckets') $('#stats-total-cost').textContent=__('multi_currency');
+    else if(quote?.selected?.amount) $('#stats-total-cost').textContent=fmtMoney(Number(quote.selected.amount),quote.selected.currency);
+    else if(quote?.displayStatus==='unavailable') $('#stats-total-cost').textContent='—';
+    else $('#stats-total-cost').textContent='—';
     $('#stats-balance').textContent=s.balance?.display||'-';
     if(s.window){const pct=Math.min(100,Math.round(s.used/s.window*100));$('#stats-ctx-fill').style.width=pct+'%';$('#stats-ctx-used').textContent=fmtTok(s.used)+' tok';$('#stats-ctx-window').textContent=fmtTok(s.window)+' tok';}
   }).catch(()=>{});

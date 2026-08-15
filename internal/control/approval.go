@@ -9,10 +9,53 @@ import (
 	"sync"
 	"time"
 
+	"reasonix/internal/agent"
 	"reasonix/internal/event"
 	"reasonix/internal/i18n"
 	"reasonix/internal/permission"
 )
+
+// Approve answers a pending ApprovalRequest by ID. It remains the compatibility
+// bridge for clients that do not yet call the scope-aware resolver directly.
+func (c *Controller) Approve(id string, allow, session, persist bool) {
+	if pending := c.approval.peek(id); pending.reply != nil && pending.kind == writeAccessKind {
+		_ = c.ResolveApproval(id, allow, scopeFromApprove(allow, session, persist))
+		return
+	}
+	c.mu.Lock()
+	gate := c.recoveryGate
+	c.mu.Unlock()
+	if gate != nil && gate.HasApproval(id) {
+		action := agent.RecoveryActionRevise
+		if allow {
+			action = agent.RecoveryActionContinue
+		}
+		_ = c.ResolveRecovery(id, action, "")
+		return
+	}
+	pending := c.approval.resolve(id)
+	if pending.reply == nil {
+		return
+	}
+	outcome := "deny"
+	if pending.tool == planApprovalTool {
+		outcome = string(PlanDecisionRevisePlan)
+		if allow {
+			outcome = string(PlanDecisionStartExecution)
+		}
+	} else if allow {
+		switch {
+		case persist:
+			outcome = "allow_persistent"
+		case session:
+			outcome = "allow_session"
+		default:
+			outcome = "allow_once"
+		}
+	}
+	c.recordDecisionReceipt(pending, outcome)
+	pending.reply <- approvalReply{allow: allow, session: session, persist: persist}
+}
 
 // approvalManager owns the approval/ask prompt bookkeeping and the runtime
 // approval posture, behind its own locks and off the controller's c.mu. It is a
@@ -263,7 +306,7 @@ func (a *approvalManager) registerDecisionKindWithInput(tool, subject, reason st
 	reply := make(chan approvalReply, 1)
 	autoDrain := false
 	if !fresh && !requireHuman {
-		autoDrain = a.autoApprovalWouldAllowLocked(tool, subject)
+		autoDrain = a.autoApprovalWouldAllowLocked(tool, subject, rawInput)
 	}
 	a.approvals[id] = pendingApproval{
 		id:   id,
@@ -271,6 +314,27 @@ func (a *approvalManager) registerDecisionKindWithInput(tool, subject, reason st
 		autoDrain: autoDrain, kind: kind, recovery: rec, reply: reply,
 	}
 	return id, reply
+}
+
+func (a *approvalManager) registerWriteAccess(tool, subject, reason string, rawInput json.RawMessage, payload *event.WriteAccessApproval) (string, chan approvalReply) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.nextID++
+	id := strconv.Itoa(a.nextID)
+	reply := make(chan approvalReply, 1)
+	a.approvals[id] = pendingApproval{
+		id: id, tool: tool, subject: subject, reason: reason,
+		rawInput: append(json.RawMessage(nil), rawInput...),
+		fresh:    true, requireHuman: true, kind: writeAccessKind,
+		writeAccess: event.NormalizeWriteAccessApproval(payload), reply: reply,
+	}
+	return id, reply
+}
+
+func (a *approvalManager) peek(id string) pendingApproval {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.approvals[id]
 }
 
 // grantSession records a session-scoped grant so future calls in the same scope
@@ -307,6 +371,7 @@ func (a *approvalManager) grantPlanModeReadOnlyCommand(prefix string) {
 type SessionAuthorizations struct {
 	Grants                   []string
 	PlanModeReadOnlyCommands []string
+	WriteRoots               []string
 }
 
 func (a *approvalManager) snapshotSessionAuthorizations() SessionAuthorizations {
@@ -367,15 +432,41 @@ func (a *approvalManager) resolveTool(id, tool string) (pendingApproval, bool) {
 }
 
 // registerAsk allocates an ask ID, records the pending question batch, and
-// returns the reply channel.
+// returns the reply channel. The ask starts queued: registering before the
+// prompt lock is what makes a question waiting behind another prompt visible
+// at all, instead of existing only inside a blocked goroutine.
 func (a *approvalManager) registerAsk(questions []event.AskQuestion) (string, chan []event.AskAnswer) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.nextID++
 	id := strconv.Itoa(a.nextID)
 	reply := make(chan []event.AskAnswer, 1)
-	a.asks[id] = pendingAsk{questions: questions, reply: reply}
+	a.asks[id] = pendingAsk{questions: questions, reply: reply, queued: true}
 	return id, reply
+}
+
+// markAskEmitted clears the queued flag once the ask has reached a frontend,
+// which is what makes it eligible for replay.
+func (a *approvalManager) markAskEmitted(id string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if p, ok := a.asks[id]; ok {
+		p.queued = false
+		a.asks[id] = p
+	}
+}
+
+// queuedAsks reports asks registered but not yet shown.
+func (a *approvalManager) queuedAsks() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, p := range a.asks {
+		if p.queued {
+			n++
+		}
+	}
+	return n
 }
 
 // cancelAsk drops a pending ask (timeout/abort path).
@@ -470,11 +561,16 @@ func (a *approvalManager) snapshotPrompts() ([]event.Approval, []event.Ask) {
 	for id, p := range a.approvals {
 		approvals = append(approvals, event.Approval{
 			ID: id, Tool: p.tool, Subject: p.subject, Reason: p.reason, RawInput: append(json.RawMessage(nil), p.rawInput...), Fresh: p.fresh,
-			Kind: p.kind, Recovery: p.recovery,
+			Kind: p.kind, Recovery: p.recovery, WriteAccess: event.NormalizeWriteAccessApproval(p.writeAccess),
 		})
 	}
 	asks := make([]event.Ask, 0, len(a.asks))
 	for id, p := range a.asks {
+		// A queued ask has never been shown; replaying it would put a question
+		// on screen ahead of the prompt it is waiting behind.
+		if p.queued {
+			continue
+		}
 		asks = append(asks, event.Ask{ID: id, Questions: p.questions})
 	}
 	return approvals, asks
@@ -487,6 +583,14 @@ func normalizePlanModeReadOnlyCommandPrefix(prefix string) string {
 // decision helpers (caller holds a.mu)
 
 func (a *approvalManager) bypassAllowsLocked(tool, subject string, args json.RawMessage) bool {
+	if isMemoryApprovalTool(tool) {
+		switch a.toolApprovalMode {
+		case ToolApprovalYolo:
+			return true
+		case ToolApprovalAuto:
+			return a.autoApprovalWouldAllowLocked(tool, subject, args)
+		}
+	}
 	if requiresFreshApprovalTool(tool) {
 		return false
 	}
@@ -504,12 +608,15 @@ func (a *approvalManager) bypassAllowsLocked(tool, subject string, args json.Raw
 	return policy.DecideSubject(tool, false, subject) == permission.Allow
 }
 
-func (a *approvalManager) autoApprovalWouldAllowLocked(tool, subject string) bool {
-	if requiresFreshApprovalTool(tool) {
+func (a *approvalManager) autoApprovalWouldAllowLocked(tool, subject string, args json.RawMessage) bool {
+	if requiresFreshApprovalTool(tool) && !isMemoryApprovalTool(tool) {
 		return false
 	}
 	policy := a.policy
 	policy.Mode = permission.Allow
+	if len(args) > 0 {
+		return policy.Decide(tool, false, args) == permission.Allow
+	}
 	return policy.DecideSubject(tool, false, subject) == permission.Allow
 }
 
@@ -527,7 +634,7 @@ func (a *approvalManager) sessionGrantAllowsLocked(tool, subject string) bool {
 
 // drainedApproval is a pending approval removed by a posture switch, keeping
 // its prompt id so frontends can dismiss exactly the prompts the new posture
-// resolved (fresh/plan/memory prompts stay pending and must stay visible).
+// resolved (plan/sandbox/config prompts stay pending and must stay visible).
 type drainedApproval struct {
 	id    string
 	reply chan approvalReply
@@ -538,7 +645,12 @@ type drainedApproval struct {
 func (a *approvalManager) drainLocked(includeExplicitAsk bool) []drainedApproval {
 	pending := make([]drainedApproval, 0, len(a.approvals))
 	for id, approval := range a.approvals {
-		if approval.fresh || requiresFreshApprovalTool(approval.tool) {
+		memoryBypass := isMemoryApprovalTool(approval.tool) && (a.toolApprovalMode == ToolApprovalYolo ||
+			a.toolApprovalMode == ToolApprovalAuto && approval.autoDrain)
+		if approval.kind == writeAccessKind {
+			continue
+		}
+		if (approval.fresh || requiresFreshApprovalTool(approval.tool)) && !memoryBypass {
 			continue
 		}
 		if approval.requireHuman && !includeExplicitAsk {
@@ -568,14 +680,23 @@ func normalizeToolApprovalMode(mode string) string {
 	}
 }
 
-// RequiresFreshHumanApprovalTool reports whether a tool's unsafe variants must
-// be answered by a human decision, not by YOLO/auto approval, Guardian, or a
-// non-interactive nil approver. A controller that owns the scoped memory store
-// may still classify a bounded new project memory as create-only and allow that
-// narrow operation in interactive or headless mode.
+// RequiresFreshHumanApprovalTool reports tools that session grants,
+// Guardian/hooks, and headless nil approvers cannot authorize. Interactive Auto
+// treats remember/forget as normal policy fallback, while interactive YOLO may
+// also bypass explicit memory ask rules. A controller that owns the scoped
+// memory store may still auto-allow a bounded create-only project memory.
 func RequiresFreshHumanApprovalTool(tool string) bool {
 	switch tool {
 	case planApprovalTool, memoryRememberTool, memoryForgetTool, SandboxEscapeApprovalTool, ManagedConfigWriteApprovalTool:
+		return true
+	default:
+		return false
+	}
+}
+
+func isMemoryApprovalTool(tool string) bool {
+	switch tool {
+	case memoryRememberTool, memoryForgetTool:
 		return true
 	default:
 		return false
